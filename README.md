@@ -2,28 +2,44 @@
 
 This project automates the setup of a privacy-focused Tailscale Tor exit node using KVM virtualization. All VM traffic is routed through a transparent Tor proxy.
 
+> **Connection Status**: Tor container is currently being worked on, even though it starts up in final build it cannot connect to the tor circuit.
+
+
 ## Architecture
+### Host Structure:
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                     Host Server (KVM)                       │
-│  ┌───────────────────────────────────────────────────────┐  │
-│  │               Ubuntu 22.04 VM                         │  │
-│  │  ┌─────────────────┐    ┌──────────────────────────┐  │  │
-│  │  │   Tailscale     │    │      Tor Container       │  │  │
-│  │  │   Exit Node     │    │   (Alpine + Tor)         │  │  │
-│  │  │                 │    │   - TransPort 9040       │  │  │
-│  │  │                 │    │   - DNSPort 9053         │  │  │
-│  │  └─────────────────┘    └──────────────────────────┘  │  │
-│  │            │                        │                 │  │
-│  │            └────────iptables────────┘                 │  │
-│  │              (Transparent Proxy)                      │  │
-│  └───────────────────────────────────────────────────────┘  │
-│                            │                                │
-│                    NAT Network Bridge                       │
-│                     192.168.100.0/24                        │
-└─────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────┐
+│                        Host Server (KVM)                        │
+│                                                                 │
+│  ┌───────────────────────────────────────────────────────────┐  │
+│  │                    Ubuntu 22.04 VM                        │  │
+│  │                                                           │  │
+│  │  ┌─────────────────────────┐  ┌─────────────────────────┐ │  │
+│  │  │      Tailscale          │  │     Tor Container       │ │  │
+│  │  │      Exit Node          │◄─┤   (Alpine + Tor)        │ │  │
+│  │  │                         │  │                         │ │  │
+│  │  │  • Exit routing         │  │  • TransPort: 9040      │ │  │
+│  │  │  • Client mgmt          │  │  • DNSPort: 9053        │ │  │
+│  │  │                         │  │  • SOCKS5: 9050         │ │  │
+│  │  └─────────────────────────┘  └─────────────────────────┘ │  │
+│  │            │                            ▲                 │  │
+│  │            │          iptables          │                 │  │
+│  │            └─────► Transparent Proxy ───┘                 │  │
+│  │                    (NAT REDIRECT)                         │  │
+│  │                                                           │  │
+│  │  Traffic Flow: Client → Tailscale → iptables → Tor → Web  │  │
+│  └───────────────────────────────────────────────────────────┘  │
+│                                 │                               │
+│                        KVM NAT Network                          │
+│                      (192.168.100.0/24)                         │
+│                                 │                               │
+│                        Physical Network                         │
+└─────────────────────────────────────────────────────────────────┘
 ```
+
+### System Design:
+![Tor Proxy Sistem Tasarımı](tor-proxy-systemdesign.png)
 
 ## Features
 
