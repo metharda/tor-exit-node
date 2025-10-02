@@ -1,0 +1,45 @@
+# Genel
+*.log
+*.tmp
+*.bak
+*.swp
+*.swo
+*.DS_Store
+__pycache__/
+*.pyc
+*.pyo
+*.env
+.env*
+
+# Ansible
+ansible/inventory.ini
+ansible/inventory.ini.tpl
+ansible/roles/*/files/*
+ansible/roles/*/templates/*.j2
+
+# Terraform
+terraform/*.tfstate
+terraform/*.tfstate.backup
+terraform/.terraform/
+terraform/.terraform.lock.hcl
+
+# Docker
+*.pid
+docker-compose.override.yml
+
+# Scripts
+scripts/maintenance/*.log
+
+# Kişisel/Secret dosyalar
+secrets.yml
+*.key
+*.pem
+*.crt
+*.secret
+*.vault
+
+# Notlar
+notes.txt
+
+# VSCode
+.vscode/

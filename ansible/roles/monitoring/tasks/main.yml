@@ -1,0 +1,169 @@
+---
+- name: Create node_exporter user
+  user:
+    name: node_exporter
+    system: true
+    shell: /bin/false
+    home: /var/lib/node_exporter
+    create_home: false
+
+- name: Download node_exporter
+  get_url:
+    url: https://github.com/prometheus/node_exporter/releases/download/v1.6.1/node_exporter-1.6.1.linux-amd64.tar.gz
+    dest: /tmp/node_exporter.tar.gz
+    mode: '0644'
+
+- name: Extract node_exporter
+  unarchive:
+    src: /tmp/node_exporter.tar.gz
+    dest: /tmp
+    remote_src: true
+
+- name: Install node_exporter binary
+  copy:
+    src: /tmp/node_exporter-1.6.1.linux-amd64/node_exporter
+    dest: /usr/local/bin/node_exporter
+    mode: '0755'
+    owner: root
+    group: root
+    remote_src: true
+
+- name: Create node_exporter systemd service
+  template:
+    src: node-exporter.service.j2
+    dest: /etc/systemd/system/node_exporter.service
+    mode: '0644'
+  notify:
+    - reload systemd
+    - restart node_exporter
+
+- name: Create node_exporter configuration directory
+  file:
+    path: /etc/node_exporter
+    state: directory
+    mode: '0755'
+    owner: node_exporter
+    group: node_exporter
+
+- name: Configure node_exporter text file collector
+  file:
+    path: /var/lib/node_exporter/textfile_collector
+    state: directory
+    mode: '0755'
+    owner: node_exporter
+    group: node_exporter
+
+- name: Create custom metrics script
+  copy:
+    dest: /usr/local/bin/tor-metrics.sh
+    content: |
+      #!/bin/bash
+      
+      set -euo pipefail
+      
+      METRICS_FILE="/var/lib/node_exporter/textfile_collector/tor.prom"
+      
+      if docker ps --filter "name=tor-proxy" --filter "status=running" | grep -q tor-proxy; then
+          echo "tor_container_running 1" > "$METRICS_FILE"
+      else
+          echo "tor_container_running 0" > "$METRICS_FILE"
+      fi
+      
+      if tailscale status >/dev/null 2>&1; then
+          echo "tailscale_running 1" >> "$METRICS_FILE"
+      else
+          echo "tailscale_running 0" >> "$METRICS_FILE"
+      fi
+      
+      if nc -z 172.20.0.10 9050 2>/dev/null; then
+          echo "tor_socks_port_open 1" >> "$METRICS_FILE"
+      else
+          echo "tor_socks_port_open 0" >> "$METRICS_FILE"
+      fi
+      
+      if dig +time=2 +tries=1 @172.20.0.10 -p 9053 example.com A >/dev/null 2>&1; then
+        echo "tor_dns_port_open 1" >> "$METRICS_FILE"
+      else
+        echo "tor_dns_port_open 0" >> "$METRICS_FILE"
+      fi
+      
+      IPTABLES_RULES=$(iptables -t nat -L TORPROXY 2>/dev/null | wc -l)
+      echo "transparent_proxy_rules_count $IPTABLES_RULES" >> "$METRICS_FILE"
+    mode: '0755'
+    owner: root
+    group: root
+
+- name: Create tor metrics cron job
+  cron:
+    name: "Generate Tor metrics"
+    minute: "*"
+    job: "/usr/local/bin/tor-metrics.sh"
+    user: root
+
+- name: Enable and start node_exporter
+  systemd:
+    name: node_exporter
+    state: started
+    enabled: true
+    daemon_reload: true
+
+- name: Create alerting script
+  copy:
+    dest: /usr/local/bin/alert-check.sh
+    content: |
+      #!/bin/bash
+      
+      set -euo pipefail
+      
+      LOG_FILE="/var/log/alert-check.log"
+      
+      log_alert() {
+          echo "$(date '+%Y-%m-%d %H:%M:%S') ALERT: $1" | tee -a "$LOG_FILE"
+      }
+      
+      if ! docker ps --filter "name=tor-proxy" --filter "status=running" | grep -q tor-proxy; then
+          log_alert "Tor container is not running"
+      fi
+      
+      if ! tailscale status >/dev/null 2>&1; then
+          log_alert "Tailscale is not running"
+      fi
+      
+      if ! nc -z 172.20.0.10 9050 2>/dev/null; then
+          log_alert "Tor SOCKS port is not accessible"
+      fi
+      
+      if ! dig +time=2 +tries=1 @172.20.0.10 -p 9053 example.com A >/dev/null 2>&1; then
+        log_alert "Tor DNS (UDP 9053) is not accessible"
+      fi
+      
+      IPTABLES_RULES=$(iptables -t nat -L TORPROXY 2>/dev/null | wc -l)
+      if [ "$IPTABLES_RULES" -lt 5 ]; then
+          log_alert "Transparent proxy rules missing or incomplete"
+      fi
+    mode: '0755'
+    owner: root
+    group: root
+
+- name: Create alerting cron job
+  cron:
+    name: "Alert checks"
+    minute: "*/5"
+    job: "/usr/local/bin/alert-check.sh"
+    user: root
+
+- name: Clean up downloaded files
+  file:
+    path: "{{ item }}"
+    state: absent
+  loop:
+    - /tmp/node_exporter.tar.gz
+    - /tmp/node_exporter-1.6.1.linux-amd64
+
+- name: Verify node_exporter is accessible
+  uri:
+    url: http://localhost:9100/metrics
+    method: GET
+    status_code: 200
+  retries: 3
+  delay: 10

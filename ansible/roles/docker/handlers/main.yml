@@ -1,0 +1,6 @@
+---
+- name: restart docker
+  systemd:
+    name: docker
+    state: restarted
+  when: not (disable_handlers | default(false))

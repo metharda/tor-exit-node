@@ -1,0 +1,114 @@
+---
+- name: Configure KVM Tailscale Tor Exit Node
+  hosts: exit_nodes
+  become: true
+  gather_facts: true
+  vars:
+    ansible_python_interpreter: /usr/bin/python3
+
+  pre_tasks:
+    - name: Wait for system to become reachable
+      wait_for_connection:
+        timeout: 300
+
+    - name: Wait for cloud-init to complete
+      wait_for:
+        path: /var/lib/cloud/instance/boot-finished
+        timeout: 600
+
+    - name: Wait for network to be ready
+      uri:
+        url: http://archive.ubuntu.com/ubuntu/
+        method: HEAD
+        timeout: 10
+      register: network_test
+      until: network_test is succeeded
+      retries: 30
+      delay: 10
+
+    - name: Update package cache with retries
+      apt:
+        update_cache: true
+        cache_valid_time: 3600
+      register: apt_update
+      until: apt_update is succeeded
+      retries: 10
+      delay: 30
+
+    - name: Ensure system is fully updated
+      apt:
+        upgrade: dist
+        update_cache: true
+      register: apt_upgrade
+      until: apt_upgrade is succeeded
+      retries: 5
+      delay: 60
+
+  roles:
+    - system-hardening
+    - docker
+    - tor-container  # First setup secure Tor proxy
+    - networking     # Configure transparent proxy iptables 
+    - tailscale      # Then setup Tailscale exit node
+    #- monitoring
+
+  post_tasks:
+    - name: Apply pending handler changes before verification
+      meta: flush_handlers
+
+    - name: Ensure transparent-proxy is started and enabled
+      systemd:
+        name: transparent-proxy
+        state: started
+        enabled: true
+
+    - name: Verify tor transparent proxy setup
+      shell: |
+        # Check if transparent-proxy service is active
+        systemctl is-active transparent-proxy.service
+      register: tor_proxy_status
+      failed_when: tor_proxy_status.stdout != "active"
+
+    - name: Verify Docker Tor container
+      docker_container_info:
+        name: tor-proxy
+      register: tor_container_info
+      failed_when: not tor_container_info.exists or tor_container_info.container.State.Status != "running"
+
+    - name: Check iptables transparent proxy rules
+      shell: |
+        iptables -t nat -L OUTPUT | grep -q "REDIRECT.*9040"
+      register: iptables_check
+      failed_when: iptables_check.rc != 0
+
+    - name: Test Tor connectivity
+      uri:
+        url: https://check.torproject.org/api/ip
+        method: GET
+        timeout: 30
+      register: tor_test
+      retries: 3
+      delay: 10
+
+    - name: Verify services are running
+      systemd:
+        name: "{{ item }}"
+        state: started
+        enabled: true
+      loop:
+        - docker
+        - tailscaled
+        - ufw
+        - transparent-proxy
+
+    - name: Display deployment status
+      debug:
+        msg:
+          - "KVM Tailscale Tor Exit Node deployment completed successfully!"
+          - "VM IP: {{ ansible_default_ipv4.address }}"
+          - "Tailscale status: Run 'sudo tailscale status' to check"
+          - "Tor container: {{ tor_container_info.container.State.Status }}"
+          - "Tor IP check: {{ tor_test.json.IP if tor_test.json is defined else 'Failed to get Tor IP' }}"
+          - "Transparent proxy: {{ 'Active' if tor_proxy_status.stdout == 'active' else 'Inactive' }}"
+          - "Next step: Authorize this machine in Tailscale admin panel"
+          - "Verify exit node: ssh to VM and run 'curl -s https://ipinfo.io/ip'"

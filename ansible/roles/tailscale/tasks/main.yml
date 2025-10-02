@@ -1,0 +1,165 @@
+---
+- name: Verify Tor proxy is running before Tailscale setup
+  wait_for:
+    port: 9050
+    host: 172.20.0.10
+    timeout: 60
+
+- name: Check system DNS configuration
+  shell: |
+    echo "Current resolv.conf:"
+    cat /etc/resolv.conf
+    echo "DNS test to Tor DNSPort (via localhost forwarder):"
+    if command -v dig >/dev/null 2>&1; then
+      dig +time=3 +tries=1 @127.0.0.1 google.com A || echo "Localhost DNS failed"
+      echo "Direct Tor DNS test:"
+      dig +time=2 +tries=1 @172.20.0.10 -p 9053 google.com A || echo "Direct Tor DNS failed"
+    else
+      echo "dig not installed; skipping DNS tests"
+    fi
+    echo "Testing container connectivity:"
+    nc -zv 172.20.0.10 9050 || echo "SOCKS port not reachable"
+    echo "Testing DNS forwarder service:"
+    systemctl status tor-dns-forwarder --no-pager -l || echo "DNS forwarder not running"
+  register: dns_debug
+  changed_when: false
+
+- name: Display DNS debug information
+  debug:
+    msg: "{{ dns_debug.stdout_lines }}"
+
+- name: Test Tor connectivity before Tailscale
+  shell: |
+    echo "Testing DNS resolution through localhost forwarder..."
+    if command -v dig >/dev/null 2>&1; then
+      dig +time=3 +tries=1 @127.0.0.1 httpbin.org A || echo "DNS failed"
+    else
+      echo "dig not installed; testing with nslookup"
+      nslookup httpbin.org 127.0.0.1 || echo "nslookup failed"
+    fi
+    echo "Testing direct connection to Tor container..."
+    curl --socks5 172.20.0.10:9050 --connect-timeout 30 https://httpbin.org/ip
+  register: tor_test
+  retries: 3
+  delay: 10
+
+- name: Confirm Tor is ready
+  debug:
+    msg: "Tor proxy test result: {{ tor_test.stdout_lines }}"
+
+- name: Add Tailscale GPG key
+  apt_key:
+    url: https://pkgs.tailscale.com/stable/ubuntu/jammy.noarmor.gpg
+    state: present
+    keyring: /usr/share/keyrings/tailscale-archive-keyring.gpg
+
+- name: Add Tailscale repository
+  apt_repository:
+    repo: "deb [signed-by=/usr/share/keyrings/tailscale-archive-keyring.gpg] https://pkgs.tailscale.com/stable/ubuntu jammy main"
+    state: present
+    update_cache: true
+
+- name: Install Tailscale
+  apt:
+    name: tailscale
+    state: present
+
+- name: Create Tailscale setup script
+  template:
+    src: tailscale-setup.sh.j2
+    dest: /tmp/tailscale-setup.sh
+    mode: '0755'
+
+- name: Run Tailscale setup
+  command: /tmp/tailscale-setup.sh
+  register: tailscale_setup_result
+  changed_when: tailscale_setup_result.rc == 0
+
+- name: Configure Tailscale to advertise exit node
+  command: >
+    tailscale up --reset
+    --advertise-exit-node
+    --accept-routes
+    --auth-key={{ tailscale_auth_key }}
+    --hostname={{ tailscale_hostname | default(inventory_hostname) }}
+  register: tailscale_up_result
+  changed_when: tailscale_up_result.rc == 0
+  failed_when: 
+    - tailscale_up_result.rc != 0
+    - "'already logged in' not in tailscale_up_result.stderr"
+    - "'already running' not in tailscale_up_result.stderr"
+    - "'No change' not in tailscale_up_result.stderr"
+
+- name: Disable IPv6 on Tailscale interface
+  sysctl:
+    name: net.ipv6.conf.tailscale0.disable_ipv6
+    value: "1"
+    state: present
+    reload: true
+  ignore_errors: true
+
+- name: Enable IP forwarding for Tailscale
+  sysctl:
+    name: "{{ item }}"
+    value: "1"
+    state: present
+    reload: true
+  loop:
+    - net.ipv4.ip_forward
+    - net.ipv4.conf.all.forwarding
+
+- name: Create Tailscale service override directory
+  file:
+    path: /etc/systemd/system/tailscaled.service.d
+    state: directory
+    mode: '0755'
+
+- name: Create Tailscale service hardening override
+  copy:
+    dest: /etc/systemd/system/tailscaled.service.d/hardening.conf
+    content: |
+      [Service]
+      NoNewPrivileges=yes
+      PrivateTmp=yes
+      ProtectSystem=strict
+      ProtectHome=yes
+      ProtectKernelTunables=no
+      ProtectKernelModules=yes
+      ProtectControlGroups=yes
+      RestrictSUIDSGID=yes
+      RemoveIPC=yes
+      RestrictRealtime=yes
+      RestrictNamespaces=yes
+      LockPersonality=yes
+      MemoryDenyWriteExecute=yes
+      RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+      SystemCallFilter=@system-service
+      SystemCallErrorNumber=EPERM
+    mode: '0644'
+  notify:
+    - reload systemd
+    - restart tailscaled
+
+- name: Enable and start Tailscale service
+  systemd:
+    name: tailscaled
+    state: started
+    enabled: true
+    daemon_reload: true
+
+- name: Wait for Tailscale interface to be ready
+  wait_for:
+    timeout: 30
+  delegate_to: localhost
+
+- name: Get Tailscale status
+  command: tailscale status --json
+  register: tailscale_status
+  changed_when: false
+
+- name: Display Tailscale configuration
+  debug:
+    msg:
+      - "Tailscale is running and configured as exit node"
+      - "Remember to authorize this machine in the Tailscale admin panel"
+      - "Admin panel: https://login.tailscale.com/admin/machines"

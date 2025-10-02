@@ -1,0 +1,116 @@
+#cloud-config
+hostname: ${hostname}
+manage_etc_hosts: true
+fqdn: ${hostname}.local
+
+# Configure specified user
+users:
+  - name: ${username}
+    gecos: VM User
+    sudo: ALL=(ALL) NOPASSWD:ALL
+    shell: /bin/bash
+    groups: sudo,docker
+    lock_passwd: false
+    # Password will be hashed by cloud-init
+    plain_text_passwd: ${password}
+    ssh_authorized_keys:
+      - ${ssh_public_key}
+
+# Also ensure default ubuntu user has the same access (fallback)
+system_info:
+  default_user:
+    name: ${username}
+    gecos: VM User
+    sudo: ALL=(ALL) NOPASSWD:ALL
+    shell: /bin/bash
+    groups: sudo,docker
+    lock_passwd: false
+    plain_text_passwd: ${password}
+
+# Enable password authentication for SSH (in case of key issues)
+ssh_pwauth: true
+chpasswd:
+  expire: false
+  users:
+    - name: ${username}
+      password: ${password}
+      type: text
+
+package_update: true
+package_upgrade: true
+
+# Network configuration
+network:
+  version: 2
+  ethernets:
+    enp1s0:
+      dhcp4: true
+      dhcp6: false
+
+# Wait for network and DNS
+runcmd:
+  # Wait for network to be ready
+  - |
+    echo "Waiting for network connectivity..."
+    for i in {1..30}; do
+      if ping -c 1 8.8.8.8 >/dev/null 2>&1; then
+        echo "Network is ready"
+        break
+      fi
+      echo "Network attempt $i/30, waiting 10 seconds..."
+      sleep 10
+    done
+  
+  # Update package cache with retries
+  - |
+    echo "Updating package cache..."
+    for i in {1..5}; do
+      if apt-get update; then
+        echo "Package cache updated successfully"
+        break
+      fi
+      echo "Cache update attempt $i/5 failed, waiting 30 seconds..."
+      sleep 30
+    done
+
+packages:
+  - curl
+  - wget
+  - git
+  - htop
+  - vim
+  - ufw
+  - fail2ban
+  - docker.io
+  - docker-compose
+  - python3
+  - python3-pip
+  - iptables-persistent
+  - bridge-utils
+
+write_files:
+  - path: /tmp/setup-tailscale.sh
+    permissions: '0755'
+    content: |
+      #!/bin/bash
+      set -euo pipefail
+      
+      # Install Tailscale
+      curl -fsSL https://tailscale.com/install.sh | sh
+      
+      # Start Tailscale with auth key
+      tailscale up --auth-key="${tailscale_key}" --advertise-exit-node --accept-routes
+      
+      # Enable IP forwarding
+      echo 'net.ipv4.ip_forward = 1' >> /etc/sysctl.conf
+      echo 'net.ipv6.conf.all.forwarding = 1' >> /etc/sysctl.conf
+      sysctl -p
+
+runcmd:
+  - systemctl enable docker
+  - systemctl start docker
+  - usermod -aG docker ${username}
+  - ufw --force disable  # We'll use iptables directly
+  - echo "VM setup complete - Tor and Tailscale will be configured via Ansible!" > /var/log/cloud-init-setup.log
+
+final_message: "Tor transparent proxy VM setup completed successfully!"

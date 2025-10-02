@@ -1,0 +1,29 @@
+---
+- name: reload systemd
+  systemd:
+    daemon_reload: true
+  #when: not (disable_handlers | default(false))
+
+- name: restart iptables-restore
+  systemd:
+    name: iptables-restore
+    state: restarted
+  #when: not (disable_handlers | default(false))
+
+- name: restart transparent-proxy
+  systemd:
+    name: transparent-proxy
+    state: restarted
+  #when: not (disable_handlers | default(false))
+
+- name: restart dns-forwarder
+  systemd:
+    name: tor-dns-forwarder
+    state: restarted
+  #when: not (disable_handlers | default(false))
+
+- name: restart dnsmasq
+  systemd:
+    name: dnsmasq
+    state: restarted
+  #when: not (disable_handlers | default(false))

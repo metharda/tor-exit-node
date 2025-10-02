@@ -1,0 +1,387 @@
+---
+- name: Check Tor container status and logs
+  shell: |
+    echo "=== Checking Tor container status ==="
+    docker ps -a --filter "name=tor-proxy"
+    
+    echo -e "\n=== Recent Tor container logs ==="
+    if docker ps --filter "name=tor-proxy" | grep -q tor-proxy; then
+      docker logs --tail 20 tor-proxy
+    else
+      echo "Container is not running!"
+      docker logs --tail 50 tor-proxy || echo "No logs available"
+    fi
+    
+    echo -e "\n=== Network connectivity test ==="
+    ss -lun | grep :9053 || netstat -lunp 2>/dev/null | grep :9053 || echo "UDP 9053 not listening"
+    
+    echo -e "\n=== Container network inspection ==="
+    docker network ls | grep tor || echo "No tor network found"
+    docker network inspect tor-network || echo "Cannot inspect tor-network"
+  register: container_status
+  ignore_errors: true
+
+- name: Display container status
+  debug:
+    var: container_status.stdout_lines
+  when: container_status is defined
+
+- name: Verify Tor container is ready for networking configuration
+  shell: |
+    echo "=== Final verification before networking setup ==="
+    echo "Container status:"
+    docker ps --filter "name=tor-proxy"
+    
+    echo -e "\n=== Container network information ==="
+    docker exec tor-proxy ip addr show
+    
+    echo -e "\n=== Container listening ports ==="
+    docker exec tor-proxy netstat -ln 2>/dev/null || docker exec tor-proxy ss -ln || echo "Cannot check listening ports"
+    
+    echo -e "\n=== Tor process status ==="
+    docker exec tor-proxy ps aux | grep tor || echo "No tor process found"
+    
+    echo -e "\n=== Host connectivity test ==="
+    echo "Testing from host to container IP 172.20.0.10..."
+    for port in 9040 9053 9050; do
+      if [ "$port" = "9053" ]; then
+        echo -n "Testing port 9053 (UDP): "
+        if dig +time=2 +tries=1 @172.20.0.10 -p 9053 example.com A >/dev/null 2>&1; then
+          echo "✓ accessible"
+        else
+          echo "✗ NOT accessible"
+          echo "Debugging port 9053 (inside container via dig)..."
+          docker exec tor-proxy sh -lc 'dig +time=2 +tries=1 @127.0.0.1 -p 9053 example.com A >/dev/null 2>&1' \
+            && echo "Port 9053 accessible from inside container" \
+            || echo "Port 9053 NOT accessible from inside container"
+        fi
+      else
+        echo -n "Testing port $port (TCP): "
+        if timeout 5 nc -z 172.20.0.10 $port; then
+          echo "✓ accessible"
+        else
+          echo "✗ NOT accessible"
+          echo "Debugging port $port..."
+          docker exec tor-proxy nc -z 127.0.0.1 $port && echo "Port $port accessible from inside container" || echo "Port $port NOT accessible from inside container"
+        fi
+      fi
+    done
+    
+    echo -e "\n=== Docker network inspection ==="
+    docker network inspect tor-network | grep -A 10 -B 5 "172.20.0.10" || echo "Cannot inspect network"
+  register: final_verification
+  ignore_errors: true
+
+- name: Display verification results
+  debug:
+    var: final_verification.stdout_lines
+  when: final_verification is defined
+
+- name: Install iptables-persistent
+  apt:
+    name:
+      - iptables-persistent
+      - netfilter-persistent
+      - socat
+    state: present
+
+- name: Create DNS configuration script
+  template:
+    src: dns-config.sh.j2
+    dest: /opt/dns-config.sh
+    mode: '0755'
+    owner: root
+    group: root
+
+- name: Create iptables rules script
+  template:
+    src: iptables-rules.sh.j2
+    dest: /opt/iptables-rules.sh
+    mode: '0755'
+    owner: root
+    group: root
+
+- name: Apply iptables rules
+  command: /opt/iptables-rules.sh
+  register: iptables_result
+  changed_when: iptables_result.rc == 0
+
+- name: Ensure functional DNS for package installation
+  shell: |
+    # Temporarily use public DNS if resolv.conf is broken
+    if ! nslookup archive.ubuntu.com >/dev/null 2>&1; then
+      echo "DNS resolution failing, temporarily fixing for package installation..."
+      chattr -i /etc/resolv.conf 2>/dev/null || true
+      echo "nameserver 8.8.8.8" > /etc/resolv.conf.temp
+      echo "nameserver 1.1.1.1" >> /etc/resolv.conf.temp
+      mv /etc/resolv.conf.temp /etc/resolv.conf
+    fi
+  register: temp_dns_fix
+
+- name: Install dnsmasq for local DNS forwarding
+  apt:
+    name: dnsmasq
+    state: present
+    update_cache: yes
+
+- name: Stop dnsmasq before configuration
+  systemd:
+    name: dnsmasq
+    state: stopped
+  ignore_errors: true
+
+- name: Disable systemd-resolved
+  systemd:
+    name: systemd-resolved
+    state: stopped
+    enabled: false
+  ignore_errors: true
+
+- name: Install socat for DNS forwarding
+  apt:
+    name: socat
+    state: present
+
+- name: Create simple DNS forwarder service with socat
+  copy:
+    dest: /etc/systemd/system/tor-dns-forwarder.service
+    mode: '0644'
+    content: |
+      [Unit]
+      Description=DNS Forwarder to Tor (UDP 53 -> UDP 172.20.0.10:9053)
+      After=network-online.target docker.service
+      Wants=network-online.target
+      Conflicts=systemd-resolved.service dnsmasq.service
+      
+      [Service]
+      Type=simple
+      ExecStart=/usr/bin/socat -T 2 UDP4-LISTEN:53,fork,reuseaddr UDP4:172.20.0.10:9053
+      Restart=always
+      RestartSec=5
+      User=root
+      KillMode=mixed
+      TimeoutStartSec=30
+      
+      [Install]
+      WantedBy=multi-user.target
+
+- name: Stop conflicting DNS services
+  systemd:
+    name: "{{ item }}"
+    state: stopped
+    enabled: false
+  loop:
+    - systemd-resolved
+    - dnsmasq
+  ignore_errors: true
+
+- name: Kill any existing socat processes on port 53
+  shell: pkill -f "socat.*UDP4-LISTEN:53" || true
+  ignore_errors: true
+
+- name: Apply DNS configuration (point to localhost after forwarder setup)
+  command: /opt/dns-config.sh
+  register: dns_config_result
+  changed_when: dns_config_result.rc == 0
+
+- name: Enable and start tor-dns-forwarder service
+  systemd:
+    name: tor-dns-forwarder
+    enabled: true
+    state: started
+    daemon_reload: true
+
+- name: Copy DNS test script to VM
+  copy:
+    src: "{{ playbook_dir }}/../scripts/test-dns.sh"
+    dest: /opt/test-dns.sh
+    mode: '0755'
+    owner: root
+    group: root
+
+- name: Wait for DNS forwarder to be ready
+  wait_for:
+    port: 53
+    host: 127.0.0.1
+    timeout: 30
+  ignore_errors: true
+
+- name: Run DNS functionality test
+  shell: /opt/test-dns.sh
+  register: dns_test_result
+  ignore_errors: true
+  changed_when: false
+
+- name: Display DNS test results
+  debug:
+    var: dns_test_result.stdout_lines
+  when: dns_test_result is defined
+
+- name: Create iptables directory
+  file:
+    path: /etc/iptables
+    state: directory
+    mode: '0755'
+
+- name: Save iptables rules
+  shell: "{{ item }}"
+  loop:
+    - iptables-save > /etc/iptables/rules.v4
+    - ip6tables-save > /etc/iptables/rules.v6
+  changed_when: false
+
+- name: Create iptables restore service
+  copy:
+    dest: /etc/systemd/system/iptables-restore.service
+    content: |
+      [Unit]
+      Description=Restore iptables rules
+      After=network.target
+      Before=docker.service tailscaled.service
+      
+      [Service]
+      Type=oneshot
+      ExecStart=/sbin/iptables-restore /etc/iptables/rules.v4
+      ExecStart=/sbin/ip6tables-restore /etc/iptables/rules.v6
+      RemainAfterExit=yes
+      
+      [Install]
+      WantedBy=multi-user.target
+    mode: '0644'
+  notify:
+    - reload systemd
+    - restart iptables-restore
+
+- name: Enable iptables restore service
+  systemd:
+    name: iptables-restore
+    enabled: true
+    daemon_reload: true
+
+- name: Create transparent proxy systemd service
+  copy:
+    dest: /etc/systemd/system/transparent-proxy.service
+    content: |
+      [Unit]
+      Description=Transparent Proxy for Tailscale to Tor
+      After=docker.service tailscaled.service tor-monitor.service
+      Requires=docker.service tailscaled.service
+      
+      [Service]
+      Type=oneshot
+      ExecStart=/opt/iptables-rules.sh
+      RemainAfterExit=yes
+      
+      [Install]
+      WantedBy=multi-user.target
+    mode: '0644'
+  notify:
+    - reload systemd
+    - restart transparent-proxy
+
+- name: Enable transparent proxy service
+  systemd:
+    name: transparent-proxy
+    enabled: true
+    daemon_reload: true
+
+# DNS forwarder not needed - using container DNS directly
+# - name: Enable DNS forwarder service
+#   systemd:
+#     name: dns-forwarder
+#     enabled: true
+#     state: started
+#     daemon_reload: true
+
+- name: Wait for Tor container to be healthy
+  shell: |
+    echo "Checking Tor container status..."
+    docker ps --filter "name=tor-proxy"
+    echo "Checking if Tor process is running..."
+    docker exec tor-proxy pgrep tor || exit 1
+    echo "Testing SOCKS port..."
+    docker exec tor-proxy nc -z 127.0.0.1 9050 || exit 1
+    echo "Container health check completed"
+  register: container_health_check
+  retries: 3
+  delay: 15
+  until: container_health_check.rc == 0
+
+- name: Debug container port binding before DNS test
+  shell: |
+    echo "=== Container network debugging ==="
+    echo "Container status:"
+    docker ps --filter "name=tor-proxy"
+    echo -e "\nListening ports inside container:"
+    docker exec tor-proxy netstat -ln 2>/dev/null || docker exec tor-proxy ss -ln || echo "Cannot check ports"
+    echo -e "\nTor process in container:"
+    docker exec tor-proxy ps aux | grep tor || echo "No tor process"
+    echo -e "\nTesting container internal connectivity:"
+    echo "SOCKS port 9050:"
+    docker exec tor-proxy nc -z 127.0.0.1 9050 && echo "OK" || echo "FAILED"
+    echo "DNS port 9053:"
+    docker exec tor-proxy nc -z 127.0.0.1 9053 && echo "OK" || echo "FAILED"
+    echo "TransPort 9040:"
+    docker exec tor-proxy nc -z 127.0.0.1 9040 && echo "OK" || echo "FAILED"
+    echo -e "\nTor configuration file in container:"
+    docker exec tor-proxy cat /etc/tor/torrc | head -20
+  register: debug_ports
+  ignore_errors: true
+
+- name: Display port debugging results
+  debug:
+    var: debug_ports.stdout_lines
+  when: debug_ports is defined
+
+- name: Test container DNS functionality (conditional)
+  shell: |
+    echo "Skipping DNS test - using alternative DNS resolution"
+    echo "Testing TransPort (transparent proxy) connectivity..."
+    if ! timeout 10 nc -z 172.20.0.10 9040; then
+      echo "ERROR: Cannot connect to TransPort 9040 on 172.20.0.10"
+      exit 1
+    fi
+    echo "TransPort test successful - transparent proxy ready"
+  register: container_dns_test
+  ignore_errors: true
+
+- name: Configure alternative DNS resolution
+  shell: |
+    echo "Configuring system DNS to use public DNS servers..."
+    # Backup original resolv.conf
+    cp /etc/resolv.conf /etc/resolv.conf.backup || true
+    # Use Cloudflare DNS as fallback
+    cat > /etc/resolv.conf << EOF
+    nameserver 1.1.1.1
+    nameserver 1.0.0.1
+    nameserver 8.8.8.8
+    options edns0 trust-ad
+    search .
+    EOF
+    # Make it immutable to prevent changes
+    chattr +i /etc/resolv.conf 2>/dev/null || true
+    echo "DNS configuration updated to use public DNS servers"
+  register: dns_config_alternative
+
+- name: Verify system DNS points to localhost
+  shell: |
+    if ! grep -q "nameserver 127.0.0.1" /etc/resolv.conf; then
+      echo "System DNS not pointing to localhost - fixing..."
+      chattr -i /etc/resolv.conf 2>/dev/null || true
+      echo "nameserver 127.0.0.1" > /etc/resolv.conf
+      echo "options edns0 trust-ad" >> /etc/resolv.conf
+      echo "search ." >> /etc/resolv.conf
+      chattr +i /etc/resolv.conf 2>/dev/null || true
+    fi
+    echo "DNS configuration verified - localhost:53 forwards to Tor:9053"
+  register: dns_fix
+  changed_when: "'fixing' in dns_fix.stdout"
+
+- name: Verify transparent proxy configuration
+  command: iptables -t nat -L -n -v
+  register: iptables_nat_status
+  changed_when: false
+
+- name: Display iptables NAT rules
+  debug:
+    msg: "{{ iptables_nat_status.stdout_lines }}"

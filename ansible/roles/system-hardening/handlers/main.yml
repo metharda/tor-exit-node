@@ -1,0 +1,23 @@
+---
+- name: restart sshd
+  systemd:
+    name: sshd
+    state: restarted
+  when: not (disable_handlers | default(false))
+
+- name: restart fail2ban
+  systemd:
+    name: fail2ban
+    state: restarted
+  when: not (disable_handlers | default(false))
+
+- name: reload systemd
+  systemd:
+    daemon_reload: true
+  when: not (disable_handlers | default(false))
+
+- name: restart ufw
+  systemd:
+    name: ufw
+    state: restarted
+  when: not (disable_handlers | default(false))

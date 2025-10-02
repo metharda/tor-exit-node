@@ -1,0 +1,13 @@
+---
+- name: rebuild tor container
+  shell: |
+    cd /opt/tor-proxy
+    docker-compose down || true
+    docker rmi tor-proxy_tor-proxy || true
+    docker-compose build --no-cache
+    docker-compose up -d
+  args:
+    chdir: /opt/tor-proxy
+  when:
+    - not (disable_handlers | default(false))
+    - not (disable_tor_container_handlers | default(false))

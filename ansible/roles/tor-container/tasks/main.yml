@@ -1,0 +1,175 @@
+---
+- name: Create Tor container directory
+  file:
+    path: /opt/tor-proxy
+    state: directory
+    mode: '0755'
+    owner: root
+    group: root
+
+- name: Copy Tor configuration
+  copy:
+    src: torrc
+    dest: /opt/tor-proxy/torrc
+    mode: '0644'
+    owner: root
+    group: root
+  notify: rebuild tor container
+
+- name: Copy optimized Dockerfile
+  copy:
+    src: Dockerfile
+    dest: /opt/tor-proxy/Dockerfile
+    mode: '0644'
+    owner: root
+    group: root
+  notify: rebuild tor container
+
+- name: Copy entrypoint script
+  copy:
+    src: entrypoint.sh
+    dest: /opt/tor-proxy/entrypoint.sh
+    mode: '0755'
+    owner: root
+    group: root
+  notify: rebuild tor container
+
+- name: Copy secure docker-compose.yml
+  copy:
+    src: docker-compose.yml
+    dest: /opt/tor-proxy/docker-compose.yml
+    mode: '0644'
+    owner: root
+    group: root
+
+- name: Clean up existing Tor containers and images
+  shell: |
+    docker stop tor-proxy || true
+    docker rm tor-proxy || true
+    docker rmi tor-proxy_tor-proxy || true
+    docker volume rm tor-proxy_tor-data || true
+    docker network rm tor-network || true
+    docker system prune -f
+  ignore_errors: true
+
+- name: Create secure Docker network for Tor
+  docker_network:
+    name: tor-network
+    driver: bridge
+    ipam_config:
+      - subnet: "172.20.0.0/16"
+    state: present
+
+- name: Build and start Tor container
+  shell: |
+    cd /opt/tor-proxy
+    echo "Stopping existing container..."
+    docker-compose down || true
+    echo "Building Tor container..."
+    docker-compose build --no-cache
+    echo "Starting Tor container..."
+    docker-compose up -d
+    echo "Waiting for container to initialize..."
+    sleep 10
+  register: tor_startup
+
+- name: Wait for container to be running
+  shell: |
+    i=1
+    while [ $i -le 30 ]; do
+      if docker ps --filter "name=tor-proxy" --filter "status=running" | grep -q tor-proxy; then
+        echo "Container is running"
+        exit 0
+      fi
+      echo "Waiting for container to start... ($i/30)"
+      i=$((i+1))
+      sleep 2
+    done
+    echo "Container failed to start within timeout"
+    exit 1
+  register: container_wait
+
+- name: Debug Tor container status
+  shell: |
+    echo "=== Docker container status ==="
+    docker ps -a --filter "name=tor-proxy"
+    echo "=== Container logs ==="
+    docker logs tor-proxy --tail 30
+    echo "=== Container health ==="
+    docker inspect tor-proxy | grep -A 5 '"Health"' || echo "No health status"
+    echo "=== Network connectivity test ==="
+    docker exec tor-proxy netstat -ln 2>/dev/null || docker exec tor-proxy ss -ln || echo "No netstat/ss available"
+    echo "=== Container IP ==="
+    docker inspect tor-proxy | grep -A 10 '"Networks"' | grep '"IPAddress"' || echo "Cannot get IP"
+    echo "=== Verify Tor processes ==="
+    docker exec tor-proxy ps aux || echo "Cannot list processes"
+  register: tor_debug
+  ignore_errors: true
+
+- name: Show Tor debug info
+  debug:
+    var: tor_debug.stdout_lines
+  when: tor_debug is defined
+
+- name: Wait for Tor to bootstrap and all ports to be ready
+  shell: |
+    echo "Testing Tor ports accessibility..."
+    for port in 9050 9053 9040; do
+      echo "Testing port $port..."
+      for attempt in {1..24}; do  # 2 minutes total
+        if nc -z 172.20.0.10 $port; then
+          echo "Port $port is accessible"
+          break
+        fi
+        if [ $attempt -eq 24 ]; then
+          echo "Port $port failed to become accessible"
+          echo "Container logs:"
+          docker logs tor-proxy --tail 20
+          exit 1
+        fi
+        sleep 5
+      done
+    done
+    echo "All Tor ports are accessible"
+  register: tor_ports_test
+
+- name: Test Tor SOCKS proxy
+  shell: |
+    curl --socks5 172.20.0.10:9050 --connect-timeout 30 https://httpbin.org/ip
+  register: tor_test
+  retries: 3
+  delay: 10
+  ignore_errors: true
+
+- name: Test Tor DNSPort functionality
+  shell: |
+    echo "Testing Tor DNSPort 9053..."
+    # Test with dig if available
+    if command -v dig >/dev/null 2>&1; then
+      echo "Testing with dig:"
+      dig +time=5 +tries=2 @172.20.0.10 -p 9053 google.com A || echo "dig test failed"
+    fi
+    # Test with nslookup as fallback
+    echo "Testing with nslookup on port 9053:"
+    nslookup google.com 172.20.0.10 || echo "nslookup failed"
+    # Check if port is actually listening inside container
+    echo "Checking container internal ports:"
+    docker exec tor-proxy netstat -ln 2>/dev/null | grep :9053 || docker exec tor-proxy ss -ln 2>/dev/null | grep :9053 || echo "Port 9053 not listening inside container"
+  register: tor_dns_test
+  ignore_errors: true
+
+- name: Display DNSPort test results
+  debug:
+    var: tor_dns_test.stdout_lines
+
+- name: Verify Tor is working
+  debug:
+    msg: "Tor proxy test result: {{ tor_test.stdout if tor_test.rc == 0 else 'FAILED: ' + tor_test.stderr }}"
+
+- name: Display Tor container status
+  shell: docker ps --filter "name=tor-proxy"
+  register: tor_status
+
+- name: Show Tor container info
+  debug:
+    var: tor_status.stdout_lines
