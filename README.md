@@ -1,4 +1,4 @@
-# Tailscale Tor Exit Node (KVM Edition)
+# Tailscale Tor Exit Node
 
 This project automates the setup of a privacy-focused Tailscale Tor exit node using KVM virtualization. All VM traffic is routed through a transparent Tor proxy.
 
