@@ -32,7 +32,7 @@ This project automates the setup of a privacy-focused Tailscale Tor exit node us
 │  └───────────────────────────────────────────────────────────┘  │
 │                                 │                               │
 │                        KVM NAT Network                          │
-│                      (192.168.100.0/24)                         │
+│               (192.168.100.0/24, configurable)                  │
 │                                 │                               │
 │                        Physical Network                         │
 └─────────────────────────────────────────────────────────────────┘
@@ -41,6 +41,24 @@ This project automates the setup of a privacy-focused Tailscale Tor exit node us
 ### System Design:
 ![Tor Proxy Sistem Tasarımı](tor-proxy-systemdesign.png)
 
+### How traffic is handled
+- The Tor container (Alpine + Tor, client only) runs with Docker host networking, so the
+  VM's own NAT table can `REDIRECT` traffic into Tor and Tor sees the original destination.
+  No Docker network is created, and Docker runs without a bridge, its own iptables rules or
+  IP forwarding.
+- iptables owns the firewall; UFW stays disabled. The rules live in their own chains
+  (`TORPROXY_PRE`, `TORPROXY_OUT`, `TORPROXY_IN`, `TORPROXY_EGR`, `TORPROXY_FWD`), are loaded
+  atomically by `transparent-proxy.service` after Docker and tailscaled, and never flush the
+  built-in chains.
+- Client TCP from `tailscale0` goes to TransPort 9040 and client DNS (UDP 53, to any
+  resolver) goes to DNSPort 9053. Other client UDP, ICMP and IPv6 are dropped. IP forwarding
+  stays off, so nothing from clients is forwarded to the uplink.
+- The VM's own traffic goes through Tor as well. Only Tor itself, loopback, DHCP, replies to
+  inbound connections (such as SSH) and tailscaled's own control/DERP/WireGuard traffic are
+  exempt.
+- SocksPort 9050 listens on 127.0.0.1 only; 9040 and 9053 are only accepted from
+  `tailscale0` and loopback. ControlPort is off.
+
 ## Features
 
 ### Privacy and Security
@@ -48,7 +66,7 @@ This project automates the setup of a privacy-focused Tailscale Tor exit node us
 - **DNS Leak Protection**: DNS queries forced through Tor DNSPort (9053)
 - **IPv6 Blocking**: Completely disabled to prevent IPv6 leaks
 - **VM Isolation**: Complete isolation with KVM virtualization
-- **System Hardening**: SSH, UFW firewall, fail2ban, and automatic updates
+- **System Hardening**: SSH, iptables firewall (UFW disabled), fail2ban, and automatic updates
 
 ### Container Security
 - **Isolated Tor Container**: Docker-isolated, hardened Alpine Linux
@@ -57,10 +75,10 @@ This project automates the setup of a privacy-focused Tailscale Tor exit node us
 - **Dropped Capabilities**: Minimal privilege principle compliance
 
 ### Monitoring and Maintenance
-- **Prometheus Integration**: System metrics with node_exporter
-- **Custom Tor Metrics**: Connection status and traffic statistics
+- **Prometheus Integration**: System metrics with node_exporter (the `monitoring` role is disabled in `ansible/playbook.yml` by default)
+- **Custom Tor Metrics**: Connection status (with the `monitoring` role)
 - **Automatic Log Rotation**: Disk space management
-- **Watchdog Service**: Automatic error recovery
+- **Watchdog Service**: `tor-monitor.service` checks Tor through SOCKS and restarts the container after repeated failures
 
 ## Requirements
 
@@ -83,7 +101,6 @@ This project automates the setup of a privacy-focused Tailscale Tor exit node us
 ### KVM/Libvirt Installation
 
 ```bash
-```bash
 # For Ubuntu/Debian:
 sudo apt update
 sudo apt install -y qemu-kvm libvirt-daemon-system libvirt-clients bridge-utils virtinst
@@ -102,8 +119,8 @@ sudo virsh list --all
 
 1. **Clone the repository**:
 ```bash
-git clone https://github.com/your-username/tailscale-tor-exit-node.git
-cd tailscale-tor-exit-node
+git clone https://github.com/metharda/tor-exit-node.git
+cd tor-exit-node
 ```
 
 2. **Check and install dependencies**:
@@ -155,7 +172,9 @@ make deploy
    - RAM size (MB, default: 2048)
    - CPU count (default: 2)
    - Disk size (GB, default: 20)
-   - Paste your Tailscale auth key
+   - Libvirt storage pool (an existing pool; see `sudo virsh pool-list --all`)
+   - VM network subnet (default: 192.168.100.0/24; the deploy refuses a subnet another libvirt network or route already uses)
+   - Paste your Tailscale auth key (it is not echoed and is not written to the cloud-init disk, the inventory or the Terraform state)
 
 7. **Wait for deployment completion** (~15-20 minutes):
    - Ubuntu 22.04 cloud image will be downloaded
@@ -166,7 +185,7 @@ make deploy
 8. **Approve exit node in Tailscale admin panel**:
    - Go to https://login.tailscale.com/admin/machines
    - Find your new machine and check "Enable as exit node" option
-```
+
 ## Usage
 
 ### Exit Node Usage
@@ -218,13 +237,13 @@ ssh -i terraform/vm_key ubuntu@<vm-ip> 'sudo systemctl status transparent-proxy'
 ssh -i terraform/vm_key ubuntu@<vm-ip> 'sudo docker logs tor-proxy'
 
 # Check iptables rules:
-ssh -i terraform/vm_key ubuntu@<vm-ip> 'sudo iptables -t nat -L -n -v'
+ssh -i terraform/vm_key ubuntu@<vm-ip> 'sudo iptables-save'
 
 # Check Tailscale status:
 ssh -i terraform/vm_key ubuntu@<vm-ip> 'sudo tailscale status'
 
 # Check IP address (should be Tor exit IP):
-ssh -i terraform/vm_key ubuntu@<vm-ip> 'curl -s https://ipinfo.io/ip'
+ssh -i terraform/vm_key ubuntu@<vm-ip> 'curl -s https://check.torproject.org/api/ip'
 
 # Run leak test:
 make test
@@ -251,6 +270,11 @@ sudo iptables -t nat -L -n -v
 ```bash
 make destroy
 ```
+`make destroy` deletes only what this deployment created: the resources in the Terraform
+state (VM, disk, cloud-init ISO, base image volume, `<vm-name>-network`) and the generated
+`terraform/vm_key`, `vm_key.pub`, `ansible/inventory.ini` and state. Without a state it only
+looks for those exact names. It logs the VM out of Tailscale first, or tells you to remove the
+device in the admin panel. Anything but `yes` at the prompt cancels.
 
 ## File Structure
 
@@ -272,10 +296,11 @@ make destroy
 ## Security Notes
 
 - Exit node is only accessible from your Tailscale network
-- All traffic is encrypted through the Tor network
-- DNS leaks are automatically prevented
-- IPv6 is completely disabled
+- Client TCP and DNS go through Tor; other client UDP (for example QUIC) and ICMP are dropped
+- IPv6 is disabled and dropped by ip6tables
 - System hardening is automatically applied
+- This reduces leaks; it does not make you anonymous against traffic correlation, and only the
+  cases in `scripts/leak-test.sh` are checked
 
 ## Troubleshooting
 
@@ -286,7 +311,8 @@ sudo docker logs tor-proxy
 
 # System logs:
 sudo journalctl -u tailscaled
-sudo journalctl -u tor-proxy
+sudo journalctl -u tor-monitor
+sudo journalctl -u transparent-proxy
 
 # Iptables status:
 sudo iptables-save
@@ -312,14 +338,17 @@ This project is published under the MIT license.
 
 ## Architecture
 
-- **Host**: Ubuntu 22.04.05 LTS VM with Tailscale service
-- **Container**: Hardened Tor proxy in isolated Docker container
-- **Networking**: Transparent proxy routing all Tailscale client traffic through Tor
-- **Security**: Zero-leak guarantee (IPv4, IPv6, DNS), system hardening, container isolation
+- **Host**: Ubuntu 22.04 LTS VM with Tailscale service
+- **Container**: Hardened Tor client container (non-root, read-only, all capabilities dropped) with host networking
+- **Networking**: Transparent proxy routing all Tailscale client traffic and the VM's own traffic through Tor
+- **Security**: IPv4, IPv6 and DNS leak protection as described above, system hardening, container isolation
 
-## Quick Start
+## Quick Start (short version)
 
-1. **Prerequisites**: Ensure you have access to a cloud provider (AWS, GCP, Azure, etc.)
+> This project deploys to a local KVM/libvirt host only. An older cloud-provider
+> (AWS/GCP/Azure) quick start used to be here; it no longer applies.
+
+1. **Prerequisites**: A KVM/libvirt host as described in [Requirements](#requirements)
 
 2. **Deploy**:
    ```bash
@@ -344,7 +373,7 @@ This project is published under the MIT license.
    ```bash
    make destroy
    ```
-   This safely destroys all infrastructure with confirmation prompts and creates backups.
+   This destroys only this deployment's resources after a `yes` confirmation.
 
 
 ### Tailscale Setup
@@ -400,9 +429,9 @@ make clean
    ```
 5. **Test DNS leak**:
    ```bash
-   dig @1.1.1.1 google.com
-   # Should timeout or fail (DNS blocked)
-   nslookup google.com
+   dig @9.9.9.9 example.com
+   # Answered through Tor or not at all: UDP 53 is redirected to Tor DNSPort
+   nslookup example.com
    # Should resolve through Tor DNS
    ```
 6. **Test IPv6 leak**:
@@ -416,11 +445,11 @@ make clean
 ### Attack Vectors Mitigated
 
 1. **IP Leaks**: All traffic forced through Tor container via iptables REDIRECT
-2. **DNS Leaks**: DNS queries routed through Tor DNSPort, external DNS blocked
-3. **IPv6 Leaks**: IPv6 disabled on Tailscale interface and public interface
-4. **Container Escape**: Non-root user, dropped capabilities, read-only filesystem, seccomp profile
+2. **DNS Leaks**: DNS queries (UDP 53 to any resolver) redirected to Tor DNSPort
+3. **IPv6 Leaks**: IPv6 disabled on the VM and dropped by ip6tables
+4. **Container Escape**: Non-root user, dropped capabilities, read-only filesystem, Docker's default seccomp profile
 5. **SSH Attacks**: Key-only authentication, custom port, rate limiting
-6. **System Compromise**: UFW firewall, automatic security updates, minimal packages
+6. **System Compromise**: iptables firewall, automatic security updates, minimal packages
 
 ### Tailscale ACLs
 
@@ -461,15 +490,15 @@ sudo reboot
 
 ## Monitoring
 
-- **Node Exporter**: Prometheus metrics on port 9100
-- **Log Monitoring**: Automatic Tor container restart on failures
-- **Health Checks**: Systemd watchdog services
+- **Node Exporter**: Prometheus metrics on port 9100 (with the `monitoring` role)
+- **Watchdog**: `tor-monitor.service` restarts the Tor container after repeated failed checks through Tor
+- **Health Checks**: the container is healthy only once a request through Tor succeeds
 
 ## Maintenance
 
 - **Log Rotation**: Automated via systemd timer
 - **Updates**: Automatic security updates enabled
-- **Firewall**: Persistent iptables rules across reboots
+- **Firewall**: iptables rules re-applied at boot and whenever tailscaled restarts (`transparent-proxy.service`)
 
 ## File Structure
 
@@ -477,7 +506,7 @@ sudo reboot
 terraform/              # VM provisioning
 ansible/                # Configuration management
   roles/
-    system-hardening/        # UFW, SSH, users
+    system-hardening/        # SSH, fail2ban, users (UFW disabled)
     tailscale/              # Tailscale setup
     tor-container/          # Docker + Tor container
     networking/             # Transparent proxy rules
@@ -498,13 +527,14 @@ scripts/                # Utility and deployment scripts
 
 1. **Tailscale not advertising as exit node**:
    ```bash
-   sudo tailscale up --advertise-exit-node --accept-routes
+   sudo /usr/local/sbin/tailscale-setup.sh
    ```
 
 2. **Traffic not routing through Tor**:
    ```bash
-   sudo iptables -t nat -L -n -v
-   # Check REDIRECT rules are present
+   sudo iptables -t nat -S TORPROXY_PRE
+   sudo iptables -t nat -S TORPROXY_OUT
+   # Check the REDIRECT rules are present
    ```
 
 3. **Container not starting**:
@@ -515,8 +545,8 @@ scripts/                # Utility and deployment scripts
 
 4. **DNS leaks**:
    ```bash
-   sudo iptables -L OUTPUT -n -v
-   # Verify DNS traffic is blocked/redirected
+   sudo iptables -t nat -S TORPROXY_OUT | grep 'dport 53'
+   # Verify DNS traffic is redirected to 9053
    ```
 
 5. **Infrastructure already exists error**:
@@ -528,7 +558,9 @@ scripts/                # Utility and deployment scripts
 
 6. **Destroy fails to complete**:
    ```bash
-   # Check cloud provider console for remaining resources
-   # Manually delete any remaining instances
-   make clean  # Clean local state files
+   # Check for remaining resources of this deployment (exact names):
+   sudo virsh dominfo <vm-name>
+   sudo virsh net-info <vm-name>-network
+   sudo virsh vol-list <storage-pool>
+   make destroy  # retry; the state is kept until destroy succeeds
    ```
