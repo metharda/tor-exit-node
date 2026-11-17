@@ -36,3 +36,35 @@
     enabled: true
     state: started
     daemon_reload: true
+
+- name: Apply pending firewall changes before DNS is switched to Tor
+  meta: flush_handlers
+
+- name: Create DNS configuration script
+  template:
+    src: dns-config.sh.j2
+    dest: /opt/dns-config.sh
+    mode: '0755'
+    owner: root
+    group: root
+
+- name: Point system DNS at Tor
+  command: /opt/dns-config.sh
+  register: dns_config_result
+  changed_when: "'changed' in dns_config_result.stdout"
+
+- name: Copy DNS test script to VM
+  copy:
+    src: "{{ playbook_dir }}/../scripts/test-dns.sh"
+    dest: /opt/test-dns.sh
+    mode: '0755'
+    owner: root
+    group: root
+
+- name: Check DNS through Tor (UDP 53 is redirected to DNSPort)
+  command: dig +time=10 +tries=2 check.torproject.org A +short
+  register: dns_check
+  until: dns_check.rc == 0 and dns_check.stdout | length > 0
+  retries: 5
+  delay: 10
+  changed_when: false
