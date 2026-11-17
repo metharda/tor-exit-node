@@ -58,7 +58,7 @@ test:
 	@echo "Running leak tests..."
 	@$(SCRIPTS_DIR)/leak-test.sh
 
-destroy: clean
+destroy:
 	@echo "Destroying infrastructure safely..."
 	@$(SCRIPTS_DIR)/destroy.sh
 
@@ -67,12 +67,8 @@ uninstall: destroy
 
 clean:
 	@echo "Cleaning temporary files..."
-	@rm -rf $(TERRAFORM_DIR)/.terraform
-	@rm -f $(TERRAFORM_DIR)/.terraform.lock.hcl
-	@rm -f $(TERRAFORM_DIR)/terraform.tfstate*
-	@rm -f $(TERRAFORM_DIR)/vm_key*
+	@# The state, vm_key and inventory.ini are removed by 'make destroy' only.
 	@rm -f $(TERRAFORM_DIR)/tfplan
-	@rm -f $(ANSIBLE_DIR)/inventory.ini
 	@rm -f /tmp/tailscale-tor-verification-*.txt
 	@rm -f /tmp/leak-test-report-*.txt
 	@echo "Cleanup complete"
@@ -93,12 +89,13 @@ setup-python:
 
 status:
 	@echo "Infrastructure status:"
-	@cd $(TERRAFORM_DIR) && terraform show 2>/dev/null | grep -E "(public_ip|instance_id|state)" || echo "No infrastructure found"
+	@cd $(TERRAFORM_DIR) && terraform output 2>/dev/null | grep -E "^(vm_ip|vm_name)" || echo "No infrastructure found"
 
 logs:
 	@echo "Fetching remote logs..."
-	@if [ -f $(TERRAFORM_DIR)/private_key.pem ] && [ -f $(ANSIBLE_DIR)/inventory.ini ]; then \
-		ssh -i $(TERRAFORM_DIR)/private_key.pem -o StrictHostKeyChecking=no $$(grep ansible_host $(ANSIBLE_DIR)/inventory.ini | cut -d= -f2) \
+	@if [ -f $(TERRAFORM_DIR)/vm_key ] && [ -f $(ANSIBLE_DIR)/inventory.ini ]; then \
+		ssh -i $(TERRAFORM_DIR)/vm_key -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+			$$(sed -n 's/.*ansible_user=\([^ ]*\).*/\1/p' $(ANSIBLE_DIR)/inventory.ini)@$$(cd $(TERRAFORM_DIR) && terraform output -raw vm_ip) \
 			'sudo docker logs tor-proxy --tail 50 2>/dev/null || echo "Tor container not running"'; \
 	else \
 		echo "No SSH key or inventory found. Run 'make deploy' first."; \

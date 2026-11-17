@@ -19,9 +19,10 @@ ansible/inventory.ini
 terraform/*.tfstate
 terraform/*.tfstate.backup
 terraform/.terraform/
-terraform/.terraform.lock.hcl
 terraform/vm_key
 terraform/vm_key.pub
+terraform/tfplan
+terraform/*.tfvars.json
 
 # Docker
 *.pid

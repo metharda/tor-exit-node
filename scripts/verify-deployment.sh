@@ -30,7 +30,7 @@ log_error() {
 }
 
 get_connection_info() {
-	if [[ ! -f "$TERRAFORM_DIR/private_key.pem" ]]; then
+	if [[ ! -f "$TERRAFORM_DIR/vm_key" ]]; then
 		log_error "SSH private key not found. Run 'make deploy' first."
 		exit 1
 	fi
@@ -40,17 +40,17 @@ get_connection_info() {
 		exit 1
 	fi
 
-	PUBLIC_IP=$(cd "$TERRAFORM_DIR" && terraform output -raw public_ip 2>/dev/null)
-	VM_USERNAME=$(grep ansible_user "$ANSIBLE_DIR/inventory.ini" | cut -d= -f2)
-	SSH_KEY="$TERRAFORM_DIR/private_key.pem"
+	VM_IP=$(cd "$TERRAFORM_DIR" && terraform output -raw vm_ip 2>/dev/null)
+	VM_USERNAME=$(sed -n 's/.*ansible_user=\([^ ]*\).*/\1/p' "$ANSIBLE_DIR/inventory.ini")
+	SSH_KEY="$TERRAFORM_DIR/vm_key"
 
-	if [[ -z "$PUBLIC_IP" ]]; then
-		log_error "Could not retrieve public IP from Terraform output"
+	if [[ -z "$VM_IP" ]]; then
+		log_error "Could not retrieve VM IP from Terraform output"
 		exit 1
 	fi
 
 	log_info "Connection details:"
-	log_info "  Public IP: $PUBLIC_IP"
+	log_info "  VM IP: $VM_IP"
 	log_info "  Username: $VM_USERNAME"
 	log_info "  SSH Key: $SSH_KEY"
 }
@@ -58,7 +58,7 @@ get_connection_info() {
 test_ssh_connectivity() {
 	log_info "Testing SSH connectivity..."
 
-	if ssh -i "$SSH_KEY" -o StrictHostKeyChecking=no -o ConnectTimeout=10 "$VM_USERNAME@$PUBLIC_IP" "echo 'SSH connection successful'"; then
+	if ssh -i "$SSH_KEY" -o StrictHostKeyChecking=no -o ConnectTimeout=10 "$VM_USERNAME@$VM_IP" "echo 'SSH connection successful'"; then
 		log_success "SSH connectivity verified"
 		return 0
 	else
@@ -71,7 +71,7 @@ test_tailscale_status() {
 	log_info "Checking Tailscale status..."
 
 	local tailscale_output
-	tailscale_output=$(ssh -i "$SSH_KEY" -o StrictHostKeyChecking=no "$VM_USERNAME@$PUBLIC_IP" "sudo tailscale status" 2>/dev/null || echo "")
+	tailscale_output=$(ssh -i "$SSH_KEY" -o StrictHostKeyChecking=no "$VM_USERNAME@$VM_IP" "sudo tailscale status" 2>/dev/null || echo "")
 
 	if [[ -n "$tailscale_output" ]]; then
 		log_success "Tailscale is running"
@@ -92,7 +92,7 @@ test_tor_container() {
 	log_info "Checking Tor container status..."
 
 	local container_status
-	container_status=$(ssh -i "$SSH_KEY" -o StrictHostKeyChecking=no "$VM_USERNAME@$PUBLIC_IP" "sudo docker ps --filter 'name=tor-proxy' --format 'table {{.Names}}\t{{.Status}}'" 2>/dev/null || echo "")
+	container_status=$(ssh -i "$SSH_KEY" -o StrictHostKeyChecking=no "$VM_USERNAME@$VM_IP" "sudo docker ps --filter 'name=tor-proxy' --format 'table {{.Names}}\t{{.Status}}'" 2>/dev/null || echo "")
 
 	if echo "$container_status" | grep -q "tor-proxy"; then
 		log_success "Tor container is running"
@@ -103,7 +103,7 @@ test_tor_container() {
 	fi
 
 	log_info "Testing Tor SOCKS connectivity..."
-	if ssh -i "$SSH_KEY" -o StrictHostKeyChecking=no "$VM_USERNAME@$PUBLIC_IP" "nc -z 172.20.0.10 9050" 2>/dev/null; then
+	if ssh -i "$SSH_KEY" -o StrictHostKeyChecking=no "$VM_USERNAME@$VM_IP" "nc -z 172.20.0.10 9050" 2>/dev/null; then
 		log_success "Tor SOCKS port is accessible"
 	else
 		log_error "Tor SOCKS port is not accessible"
@@ -111,7 +111,7 @@ test_tor_container() {
 	fi
 
 	log_info "Testing Tor DNS connectivity..."
-	if ssh -i "$SSH_KEY" -o StrictHostKeyChecking=no "$VM_USERNAME@$PUBLIC_IP" "nc -z 172.20.0.10 9053" 2>/dev/null; then
+	if ssh -i "$SSH_KEY" -o StrictHostKeyChecking=no "$VM_USERNAME@$VM_IP" "nc -z 172.20.0.10 9053" 2>/dev/null; then
 		log_success "Tor DNS port is accessible"
 	else
 		log_error "Tor DNS port is not accessible"
@@ -123,7 +123,7 @@ test_transparent_proxy() {
 	log_info "Checking transparent proxy configuration..."
 
 	local iptables_output
-	iptables_output=$(ssh -i "$SSH_KEY" -o StrictHostKeyChecking=no "$VM_USERNAME@$PUBLIC_IP" "sudo iptables -t nat -L TORPROXY -n -v" 2>/dev/null || echo "")
+	iptables_output=$(ssh -i "$SSH_KEY" -o StrictHostKeyChecking=no "$VM_USERNAME@$VM_IP" "sudo iptables -t nat -L TORPROXY -n -v" 2>/dev/null || echo "")
 
 	if [[ -n "$iptables_output" ]]; then
 		log_success "Transparent proxy iptables rules are configured"
@@ -137,7 +137,7 @@ test_transparent_proxy() {
 
 	log_info "Checking IPv6 blocking..."
 	local ipv6_status
-	ipv6_status=$(ssh -i "$SSH_KEY" -o StrictHostKeyChecking=no "$VM_USERNAME@$PUBLIC_IP" "sudo ip6tables -L INPUT | grep -c DROP" 2>/dev/null || echo "0")
+	ipv6_status=$(ssh -i "$SSH_KEY" -o StrictHostKeyChecking=no "$VM_USERNAME@$VM_IP" "sudo ip6tables -L INPUT | grep -c DROP" 2>/dev/null || echo "0")
 
 	if [[ "$ipv6_status" -gt 0 ]]; then
 		log_success "IPv6 traffic is blocked"
@@ -150,7 +150,7 @@ test_dns_configuration() {
 	log_info "Checking DNS configuration..."
 
 	local resolv_conf
-	resolv_conf=$(ssh -i "$SSH_KEY" -o StrictHostKeyChecking=no "$VM_USERNAME@$PUBLIC_IP" "cat /etc/resolv.conf" 2>/dev/null || echo "")
+	resolv_conf=$(ssh -i "$SSH_KEY" -o StrictHostKeyChecking=no "$VM_USERNAME@$VM_IP" "cat /etc/resolv.conf" 2>/dev/null || echo "")
 
 	if echo "$resolv_conf" | grep -q "127.0.0.1"; then
 		log_success "DNS is configured to use localhost"
@@ -162,7 +162,7 @@ test_dns_configuration() {
 
 	log_info "Testing DNS resolution through Tor..."
 	local dns_test
-	dns_test=$(ssh -i "$SSH_KEY" -o StrictHostKeyChecking=no "$VM_USERNAME@$PUBLIC_IP" "nslookup google.com 2>/dev/null | grep -c 'Server:' || echo '0'")
+	dns_test=$(ssh -i "$SSH_KEY" -o StrictHostKeyChecking=no "$VM_USERNAME@$VM_IP" "nslookup google.com 2>/dev/null | grep -c 'Server:' || echo '0'")
 
 	if [[ "$dns_test" -gt 0 ]]; then
 		log_success "DNS resolution is working"
@@ -175,7 +175,7 @@ test_monitoring() {
 	log_info "Checking monitoring setup..."
 
 	log_info "Testing node_exporter accessibility..."
-	if ssh -i "$SSH_KEY" -o StrictHostKeyChecking=no "$VM_USERNAME@$PUBLIC_IP" "curl -s http://localhost:9100/metrics | head -5" 2>/dev/null; then
+	if ssh -i "$SSH_KEY" -o StrictHostKeyChecking=no "$VM_USERNAME@$VM_IP" "curl -s http://localhost:9100/metrics | head -5" 2>/dev/null; then
 		log_success "Node exporter is accessible and serving metrics"
 	else
 		log_warn "Node exporter may not be properly configured"
@@ -183,7 +183,7 @@ test_monitoring() {
 
 	local metrics_file="/var/lib/node_exporter/textfile_collector/tor.prom"
 	local custom_metrics
-	custom_metrics=$(ssh -i "$SSH_KEY" -o StrictHostKeyChecking=no "$VM_USERNAME@$PUBLIC_IP" "cat $metrics_file 2>/dev/null || echo 'No custom metrics'")
+	custom_metrics=$(ssh -i "$SSH_KEY" -o StrictHostKeyChecking=no "$VM_USERNAME@$VM_IP" "cat $metrics_file 2>/dev/null || echo 'No custom metrics'")
 
 	if [[ "$custom_metrics" != "No custom metrics" ]]; then
 		log_success "Custom Tor metrics are available"
@@ -199,7 +199,7 @@ test_security_hardening() {
 
 	log_info "Checking UFW firewall status..."
 	local ufw_status
-	ufw_status=$(ssh -i "$SSH_KEY" -o StrictHostKeyChecking=no "$VM_USERNAME@$PUBLIC_IP" "sudo ufw status" 2>/dev/null || echo "")
+	ufw_status=$(ssh -i "$SSH_KEY" -o StrictHostKeyChecking=no "$VM_USERNAME@$VM_IP" "sudo ufw status" 2>/dev/null || echo "")
 
 	if echo "$ufw_status" | grep -q "Status: active"; then
 		log_success "UFW firewall is active"
@@ -208,14 +208,14 @@ test_security_hardening() {
 	fi
 
 	log_info "Checking fail2ban status..."
-	if ssh -i "$SSH_KEY" -o StrictHostKeyChecking=no "$VM_USERNAME@$PUBLIC_IP" "sudo systemctl is-active fail2ban" 2>/dev/null | grep -q "active"; then
+	if ssh -i "$SSH_KEY" -o StrictHostKeyChecking=no "$VM_USERNAME@$VM_IP" "sudo systemctl is-active fail2ban" 2>/dev/null | grep -q "active"; then
 		log_success "Fail2ban is active"
 	else
 		log_warn "Fail2ban may not be active"
 	fi
 
 	log_info "Checking automatic updates..."
-	if ssh -i "$SSH_KEY" -o StrictHostKeyChecking=no "$VM_USERNAME@$PUBLIC_IP" "sudo systemctl is-enabled unattended-upgrades" 2>/dev/null | grep -q "enabled"; then
+	if ssh -i "$SSH_KEY" -o StrictHostKeyChecking=no "$VM_USERNAME@$VM_IP" "sudo systemctl is-enabled unattended-upgrades" 2>/dev/null | grep -q "enabled"; then
 		log_success "Automatic security updates are enabled"
 	else
 		log_warn "Automatic security updates may not be enabled"
@@ -230,7 +230,7 @@ run_leak_tests() {
 	log_info "To test for leaks from a Tailscale client:"
 	echo
 	echo "1. Connect to your Tailscale network and set this as exit node:"
-	echo "   tailscale up --exit-node=$PUBLIC_IP"
+	echo "   tailscale up --exit-node=$VM_IP"
 	echo
 	echo "2. Test Tor routing:"
 	echo "   curl https://check.torproject.org"
@@ -253,7 +253,7 @@ run_leak_tests() {
 	log_info "Server-side routing verification:"
 
 	local routing_test
-	routing_test=$(ssh -i "$SSH_KEY" -o StrictHostKeyChecking=no "$VM_USERNAME@$PUBLIC_IP" "curl -s --socks5 172.20.0.10:9050 https://check.torproject.org | grep -c 'Congratulations' || echo '0'")
+	routing_test=$(ssh -i "$SSH_KEY" -o StrictHostKeyChecking=no "$VM_USERNAME@$VM_IP" "curl -s --socks5 172.20.0.10:9050 https://check.torproject.org | grep -c 'Congratulations' || echo '0'")
 
 	if [[ "$routing_test" -gt 0 ]]; then
 		log_success "Server can route traffic through Tor successfully"
@@ -273,11 +273,11 @@ generate_verification_report() {
 		echo "=========================================="
 		echo
 		echo "Connection Information:"
-		echo "  Public IP: $PUBLIC_IP"
-		echo "  SSH Command: ssh -i $SSH_KEY $VM_USERNAME@$PUBLIC_IP"
+		echo "  VM IP: $VM_IP"
+		echo "  SSH Command: ssh -i $SSH_KEY $VM_USERNAME@$VM_IP"
 		echo
 		echo "Service Status:"
-		ssh -i "$SSH_KEY" -o StrictHostKeyChecking=no "$VM_USERNAME@$PUBLIC_IP" "
+		ssh -i "$SSH_KEY" -o StrictHostKeyChecking=no "$VM_USERNAME@$VM_IP" "
             echo '  Tailscale:'
             sudo tailscale status | head -5 || echo '    Not running'
             echo
@@ -328,7 +328,7 @@ main() {
 	echo
 	log_info "Next steps:"
 	echo "1. Authorize the exit node in Tailscale admin: https://login.tailscale.com/admin/machines"
-	echo "2. Test from a client: tailscale up --exit-node=$PUBLIC_IP"
+	echo "2. Test from a client: tailscale up --exit-node=$VM_IP"
 	echo "3. Verify Tor routing: curl https://check.torproject.org"
 }
 

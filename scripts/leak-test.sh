@@ -30,21 +30,21 @@ log_error() {
 }
 
 get_exit_node_info() {
-	if [[ ! -f "$TERRAFORM_DIR/private_key.pem" ]] || [[ ! -f "$ANSIBLE_DIR/inventory.ini" ]]; then
+	if [[ ! -f "$TERRAFORM_DIR/vm_key" ]] || [[ ! -f "$ANSIBLE_DIR/inventory.ini" ]]; then
 		log_error "Deployment files not found. Run 'make deploy' first."
 		exit 1
 	fi
 
-	PUBLIC_IP=$(cd "$TERRAFORM_DIR" && terraform output -raw public_ip 2>/dev/null)
-	VM_USERNAME=$(grep ansible_user "$ANSIBLE_DIR/inventory.ini" | cut -d= -f2)
-	SSH_KEY="$TERRAFORM_DIR/private_key.pem"
+	VM_IP=$(cd "$TERRAFORM_DIR" && terraform output -raw vm_ip 2>/dev/null)
+	VM_USERNAME=$(sed -n 's/.*ansible_user=\([^ ]*\).*/\1/p' "$ANSIBLE_DIR/inventory.ini")
+	SSH_KEY="$TERRAFORM_DIR/vm_key"
 
-	if [[ -z "$PUBLIC_IP" ]]; then
-		log_error "Could not retrieve public IP from Terraform output"
+	if [[ -z "$VM_IP" ]]; then
+		log_error "Could not retrieve VM IP from Terraform output"
 		exit 1
 	fi
 
-	echo "Exit Node IP: $PUBLIC_IP"
+	echo "Exit Node IP: $VM_IP"
 	echo "SSH Key: $SSH_KEY"
 	echo "Username: $VM_USERNAME"
 }
@@ -53,7 +53,7 @@ test_server_side_routing() {
 	log_info "Testing server-side Tor routing..."
 
 	local tor_check
-	tor_check=$(ssh -i "$SSH_KEY" -o StrictHostKeyChecking=no "$VM_USERNAME@$PUBLIC_IP" \
+	tor_check=$(ssh -i "$SSH_KEY" -o StrictHostKeyChecking=no "$VM_USERNAME@$VM_IP" \
 		"curl -s --socks5 172.20.0.10:9050 https://check.torproject.org" 2>/dev/null || echo "")
 
 	if echo "$tor_check" | grep -q "Congratulations"; then
@@ -70,7 +70,7 @@ test_dns_leak_prevention() {
 
 	log_info "Checking resolv.conf configuration..."
 	local resolv_conf
-	resolv_conf=$(ssh -i "$SSH_KEY" -o StrictHostKeyChecking=no "$VM_USERNAME@$PUBLIC_IP" "cat /etc/resolv.conf" 2>/dev/null)
+	resolv_conf=$(ssh -i "$SSH_KEY" -o StrictHostKeyChecking=no "$VM_USERNAME@$VM_IP" "cat /etc/resolv.conf" 2>/dev/null)
 
 	if echo "$resolv_conf" | grep -q "127.0.0.1"; then
 		log_success "DNS is configured to use localhost"
@@ -82,7 +82,7 @@ test_dns_leak_prevention() {
 
 	log_info "Testing external DNS blocking..."
 	local dns_block_test
-	dns_block_test=$(ssh -i "$SSH_KEY" -o StrictHostKeyChecking=no "$VM_USERNAME@$PUBLIC_IP" \
+	dns_block_test=$(ssh -i "$SSH_KEY" -o StrictHostKeyChecking=no "$VM_USERNAME@$VM_IP" \
 		"timeout 5 dig @8.8.8.8 google.com 2>&1 || echo 'BLOCKED'" 2>/dev/null)
 
 	if echo "$dns_block_test" | grep -q "BLOCKED\|timeout\|connection timed out"; then
@@ -97,7 +97,7 @@ test_ipv6_blocking() {
 	log_info "Testing IPv6 blocking on server..."
 
 	local ipv6_disabled
-	ipv6_disabled=$(ssh -i "$SSH_KEY" -o StrictHostKeyChecking=no "$VM_USERNAME@$PUBLIC_IP" \
+	ipv6_disabled=$(ssh -i "$SSH_KEY" -o StrictHostKeyChecking=no "$VM_USERNAME@$VM_IP" \
 		"sysctl net.ipv6.conf.all.disable_ipv6" 2>/dev/null || echo "")
 
 	if echo "$ipv6_disabled" | grep -q "= 1"; then
@@ -107,7 +107,7 @@ test_ipv6_blocking() {
 	fi
 
 	local ipv6_test
-	ipv6_test=$(ssh -i "$SSH_KEY" -o StrictHostKeyChecking=no "$VM_USERNAME@$PUBLIC_IP" \
+	ipv6_test=$(ssh -i "$SSH_KEY" -o StrictHostKeyChecking=no "$VM_USERNAME@$VM_IP" \
 		"timeout 5 curl -6 https://ipv6.google.com 2>&1 || echo 'BLOCKED'" 2>/dev/null)
 
 	if echo "$ipv6_test" | grep -q "BLOCKED\|Network is unreachable\|timeout"; then
@@ -121,7 +121,7 @@ test_transparent_proxy_rules() {
 	log_info "Testing transparent proxy iptables rules..."
 
 	local iptables_rules
-	iptables_rules=$(ssh -i "$SSH_KEY" -o StrictHostKeyChecking=no "$VM_USERNAME@$PUBLIC_IP" \
+	iptables_rules=$(ssh -i "$SSH_KEY" -o StrictHostKeyChecking=no "$VM_USERNAME@$VM_IP" \
 		"sudo iptables -t nat -L TORPROXY -n" 2>/dev/null || echo "")
 
 	if [[ -n "$iptables_rules" ]]; then
@@ -140,7 +140,7 @@ test_transparent_proxy_rules() {
 	fi
 
 	local tailscale_blocks
-	tailscale_blocks=$(ssh -i "$SSH_KEY" -o StrictHostKeyChecking=no "$VM_USERNAME@$PUBLIC_IP" \
+	tailscale_blocks=$(ssh -i "$SSH_KEY" -o StrictHostKeyChecking=no "$VM_USERNAME@$VM_IP" \
 		"sudo iptables -L OUTPUT -n | grep -c '100.64.0.0/10.*DROP' || echo '0'" 2>/dev/null)
 
 	if [[ $tailscale_blocks -gt 0 ]]; then
@@ -154,7 +154,7 @@ test_container_isolation() {
 	log_info "Testing Tor container isolation..."
 
 	local container_user
-	container_user=$(ssh -i "$SSH_KEY" -o StrictHostKeyChecking=no "$VM_USERNAME@$PUBLIC_IP" \
+	container_user=$(ssh -i "$SSH_KEY" -o StrictHostKeyChecking=no "$VM_USERNAME@$VM_IP" \
 		"docker exec tor-proxy whoami 2>/dev/null || echo 'ERROR'")
 
 	if [[ "$container_user" == "tor" ]]; then
@@ -165,7 +165,7 @@ test_container_isolation() {
 	fi
 
 	local container_caps
-	container_caps=$(ssh -i "$SSH_KEY" -o StrictHostKeyChecking=no "$VM_USERNAME@$PUBLIC_IP" \
+	container_caps=$(ssh -i "$SSH_KEY" -o StrictHostKeyChecking=no "$VM_USERNAME@$VM_IP" \
 		"docker inspect tor-proxy --format '{{.HostConfig.CapDrop}}' 2>/dev/null || echo 'ERROR'")
 
 	if echo "$container_caps" | grep -q "ALL"; then
@@ -175,7 +175,7 @@ test_container_isolation() {
 	fi
 
 	local readonly_root
-	readonly_root=$(ssh -i "$SSH_KEY" -o StrictHostKeyChecking=no "$VM_USERNAME@$PUBLIC_IP" \
+	readonly_root=$(ssh -i "$SSH_KEY" -o StrictHostKeyChecking=no "$VM_USERNAME@$VM_IP" \
 		"docker inspect tor-proxy --format '{{.HostConfig.ReadonlyRootfs}}' 2>/dev/null || echo 'false'")
 
 	if [[ "$readonly_root" == "true" ]]; then
@@ -193,7 +193,7 @@ run_client_instructions() {
 	echo "=================================="
 	echo
 	echo "1. Connect to Tailscale and use this exit node:"
-	echo "   tailscale up --exit-node=$PUBLIC_IP"
+	echo "   tailscale up --exit-node=$VM_IP"
 	echo
 	echo "2. Test Tor routing (should show Tor confirmation):"
 	echo "   curl https://check.torproject.org"
@@ -250,8 +250,8 @@ generate_leak_test_report() {
 		echo "=========================================="
 		echo
 		echo "Exit Node Information:"
-		echo "  Public IP: $PUBLIC_IP"
-		echo "  SSH Access: ssh -i $SSH_KEY $VM_USERNAME@$PUBLIC_IP"
+		echo "  VM IP: $VM_IP"
+		echo "  SSH Access: ssh -i $SSH_KEY $VM_USERNAME@$VM_IP"
 		echo
 		echo "Server-Side Test Results:"
 		echo "  Total Tests: 5"
@@ -259,7 +259,7 @@ generate_leak_test_report() {
 		echo "  Status: $([[ $test_results -eq 0 ]] && echo "PASS" || echo "FAIL")"
 		echo
 		echo "Detailed Server Configuration:"
-		ssh -i "$SSH_KEY" -o StrictHostKeyChecking=no "$VM_USERNAME@$PUBLIC_IP" "
+		ssh -i "$SSH_KEY" -o StrictHostKeyChecking=no "$VM_USERNAME@$VM_IP" "
             echo 'Tor Container Status:'
             docker ps --filter 'name=tor-proxy' --format 'table {{.Names}}\t{{.Status}}\t{{.Ports}}' 2>/dev/null || echo 'Not running'
             echo

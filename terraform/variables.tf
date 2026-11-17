@@ -22,12 +22,6 @@ variable "vm_password" {
   sensitive   = true
 }
 
-variable "tailscale_auth_key" {
-  description = "Tailscale authentication key"
-  type        = string
-  sensitive   = true
-}
-
 variable "memory_mb" {
   description = "Memory size in MB"
   type        = number
@@ -47,9 +41,14 @@ variable "disk_size_gb" {
 }
 
 variable "storage_pool" {
-  description = "Libvirt storage pool name"
+  description = "Libvirt storage pool for the VM disk, base image and cloud-init ISO"
   type        = string
-  default     = "default"
+}
+
+variable "vm_network" {
+  description = "IPv4 subnet of the project's libvirt NAT network"
+  type        = string
+  default     = "192.168.100.0/24"
 }
 
 variable "network_name" {

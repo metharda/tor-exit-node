@@ -10,7 +10,7 @@ output "vm_name" {
 
 output "ssh_private_key_path" {
   description = "Path to the generated SSH private key"
-  value       = local_file.private_key.filename
+  value       = abspath(local_file.private_key.filename)
 }
 
 output "ssh_public_key" {
@@ -20,7 +20,7 @@ output "ssh_public_key" {
 
 output "ssh_command" {
   description = "SSH command to connect to the VM"
-  value       = "ssh -i ${local_file.private_key.filename} ${var.vm_username}@${libvirt_domain.vm.network_interface[0].addresses[0]}"
+  value       = "ssh -i ${abspath(local_file.private_key.filename)} ${var.vm_username}@${libvirt_domain.vm.network_interface[0].addresses[0]}"
 }
 
 output "ansible_inventory_path" {

@@ -45,7 +45,7 @@ check_pre_deployment() {
 
 	if [[ -f "$TERRAFORM_DIR/terraform.tfstate" ]] && [[ -s "$TERRAFORM_DIR/terraform.tfstate" ]]; then
 		log_warn "Existing Terraform state found"
-		read -p "Infrastructure may already be deployed. Continue anyway? (y/N): " continue_deploy
+		read -r -p "Infrastructure may already be deployed. Continue anyway? (y/N): " continue_deploy
 		if [[ "$continue_deploy" != "y" && "$continue_deploy" != "Y" ]]; then
 			log_info "Deployment cancelled by user"
 			log_info "Use 'make destroy' to remove existing infrastructure first"
@@ -56,7 +56,7 @@ check_pre_deployment() {
 	log_info "Checking code formatting..."
 	if ! "$SCRIPTS_DIR/format-check.sh" --check; then
 		log_warn "Code formatting issues found"
-		read -p "Auto-fix formatting issues? (Y/n): " fix_format
+		read -r -p "Auto-fix formatting issues? (Y/n): " fix_format
 		if [[ "$fix_format" != "n" && "$fix_format" != "N" ]]; then
 			"$SCRIPTS_DIR/format-check.sh" --fix
 			log_success "Formatting issues fixed"
@@ -70,14 +70,18 @@ collect_user_input() {
 	log_info "Collecting deployment configuration..."
 	echo
 
-	read -p "Enter VM name [$USER-tailscale-tor]: " VM_NAME
+	read -r -p "Enter VM name [$USER-tailscale-tor]: " VM_NAME
 	VM_NAME="${VM_NAME:-$USER-tailscale-tor}"
+	if [[ ! "$VM_NAME" =~ ^[A-Za-z0-9][A-Za-z0-9-]*$ ]]; then
+		log_error "VM name may only contain letters, digits and '-'"
+		exit 1
+	fi
 
-	read -p "Enter username for the VM [ubuntu]: " VM_USERNAME
+	read -r -p "Enter username for the VM [ubuntu]: " VM_USERNAME
 	VM_USERNAME="${VM_USERNAME:-ubuntu}"
 
 	while true; do
-		read -s -p "Enter password for VM user ($VM_USERNAME): " VM_PASSWORD
+		read -rs -p "Enter password for VM user ($VM_USERNAME): " VM_PASSWORD
 		echo
 		if [[ -z "$VM_PASSWORD" ]]; then
 			log_warn "Password cannot be empty"
@@ -87,7 +91,7 @@ collect_user_input() {
 			log_warn "Password must be at least 8 characters long"
 			continue
 		fi
-		read -s -p "Confirm password: " VM_PASSWORD_CONFIRM
+		read -rs -p "Confirm password: " VM_PASSWORD_CONFIRM
 		echo
 		if [[ "$VM_PASSWORD" != "$VM_PASSWORD_CONFIRM" ]]; then
 			log_warn "Passwords do not match, please try again"
@@ -112,7 +116,8 @@ collect_user_input() {
 	echo
 	
 	while true; do
-		read -p "Enter Tailscale auth key: " TAILSCALE_AUTH_KEY
+		read -rs -p "Enter Tailscale auth key: " TAILSCALE_AUTH_KEY
+		echo
 		if [[ -z "$TAILSCALE_AUTH_KEY" ]]; then
 			log_warn "Tailscale auth key cannot be empty"
 			continue
@@ -135,39 +140,90 @@ collect_user_input() {
 	done
 
 	echo
-	read -p "Enter memory size in MB [2048]: " MEMORY_MB
+	read -r -p "Enter memory size in MB [2048]: " MEMORY_MB
 	MEMORY_MB="${MEMORY_MB:-2048}"
 
-	read -p "Enter number of CPUs [2]: " VCPU_COUNT
+	read -r -p "Enter number of CPUs [2]: " VCPU_COUNT
 	VCPU_COUNT="${VCPU_COUNT:-2}"
 
-	read -p "Enter disk size in GB [20]: " DISK_SIZE_GB
+	read -r -p "Enter disk size in GB [20]: " DISK_SIZE_GB
 	DISK_SIZE_GB="${DISK_SIZE_GB:-20}"
+
+	local value
+	for value in "$MEMORY_MB" "$VCPU_COUNT" "$DISK_SIZE_GB"; do
+		if [[ ! "$value" =~ ^[1-9][0-9]*$ ]]; then
+			log_error "Memory, CPU count and disk size must be positive whole numbers (got '$value')"
+			exit 1
+		fi
+	done
 
 	echo
 	log_info "Configuration collected successfully"
 	
-	# Determine available storage pool
-	STORAGE_POOL="default"
-	if sudo virsh pool-info default >/dev/null 2>&1; then
-		STORAGE_POOL="default"
-		log_info "Using 'default' storage pool"
-	elif sudo virsh pool-info images >/dev/null 2>&1; then
-		STORAGE_POOL="images"
-		log_info "Using 'images' storage pool"
-	else
-		log_error "No suitable storage pool found"
+	# Storage pool and subnet are variables; nothing assumes a pool called
+	# "default" or "images". STORAGE_POOL / VM_NETWORK may be preset in the environment.
+	read -r -p "Enter libvirt storage pool [${STORAGE_POOL:-}]: " pool_input
+	STORAGE_POOL="${pool_input:-${STORAGE_POOL:-}}"
+	if [[ -z "$STORAGE_POOL" ]] || ! sudo virsh pool-info "$STORAGE_POOL" >/dev/null 2>&1; then
+		log_error "Storage pool '${STORAGE_POOL}' not found (see: sudo virsh pool-list --all)"
 		exit 1
 	fi
-	
-	export TF_VAR_vm_name="$VM_NAME"
-	export TF_VAR_vm_username="$VM_USERNAME"
+	if ! sudo virsh pool-info "$STORAGE_POOL" | grep -q "State:.*running"; then
+		log_error "Storage pool '$STORAGE_POOL' is not running (sudo virsh pool-start $STORAGE_POOL)"
+		exit 1
+	fi
+
+	read -r -p "Enter VM network subnet [${VM_NETWORK:-192.168.100.0/24}]: " network_input
+	VM_NETWORK="${network_input:-${VM_NETWORK:-192.168.100.0/24}}"
+	if [[ ! "$VM_NETWORK" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}/[0-9]{1,2}$ ]]; then
+		log_error "VM network must be an IPv4 CIDR such as 192.168.100.0/24"
+		exit 1
+	fi
+
+	# The deployed (non-secret) values are kept next to the state, so destroy.sh
+	# runs Terraform with exactly the variables this deployment used.
+	(
+		umask 077
+		cat >"$TERRAFORM_DIR/deploy.auto.tfvars.json" <<EOF
+{
+  "vm_name": "$VM_NAME",
+  "vm_username": "$VM_USERNAME",
+  "memory_mb": $MEMORY_MB,
+  "vcpu_count": $VCPU_COUNT,
+  "disk_size_gb": $DISK_SIZE_GB,
+  "storage_pool": "$STORAGE_POOL",
+  "vm_network": "$VM_NETWORK"
+}
+EOF
+	)
 	export TF_VAR_vm_password="$VM_PASSWORD"
-	export TF_VAR_tailscale_auth_key="$TAILSCALE_AUTH_KEY"
-	export TF_VAR_memory_mb="$MEMORY_MB"
-	export TF_VAR_vcpu_count="$VCPU_COUNT"
-	export TF_VAR_disk_size_gb="$DISK_SIZE_GB"
-	export TF_VAR_storage_pool="$STORAGE_POOL"
+}
+
+check_network_free() {
+	log_info "Checking that $VM_NETWORK is free..."
+
+	local net
+	for net in $(sudo virsh net-list --all --name); do
+		[[ "$net" == "$VM_NAME-network" ]] && continue
+		if sudo virsh net-dumpxml "$net" | python3 -c '
+import ipaddress, sys, xml.etree.ElementTree as ET
+want = ipaddress.ip_network(sys.argv[1], strict=False)
+for ip in ET.parse(sys.stdin).iter("ip"):
+    mask = ip.get("prefix") or ip.get("netmask")
+    if ip.get("family", "ipv4") == "ipv4" and ip.get("address") and mask:
+        if want.overlaps(ipaddress.ip_interface(ip.get("address") + "/" + mask).network):
+            sys.exit(0)
+sys.exit(1)' "$VM_NETWORK"; then
+			log_error "Libvirt network '$net' already uses $VM_NETWORK; refusing to deploy"
+			exit 1
+		fi
+	done
+
+	if ! sudo virsh net-info "$VM_NAME-network" >/dev/null 2>&1 &&
+		[[ -n "$(ip -4 route show "$VM_NETWORK")" ]]; then
+		log_error "$VM_NETWORK is already routed on this host; refusing to deploy"
+		exit 1
+	fi
 }
 
 check_libvirt() {
@@ -186,95 +242,7 @@ check_libvirt() {
 		exit 1
 	fi
 
-	# Check if default network exists
-	if ! sudo virsh net-info default >/dev/null 2>&1; then
-		log_info "Creating default network..."
-		sudo virsh net-define /usr/share/libvirt/networks/default.xml
-		sudo virsh net-autostart default
-		sudo virsh net-start default
-	fi
-
-	# Check storage pools
-	log_info "Checking storage pools..."
-	
-	# First, try to find an existing suitable pool
-	if sudo virsh pool-info default >/dev/null 2>&1; then
-		log_info "Default pool already exists"
-		# Ensure it's started
-		if ! sudo virsh pool-info default | grep -q "State:.*running"; then
-			sudo virsh pool-start default >/dev/null 2>&1 || true
-		fi
-	else
-		# Check if 'images' pool exists (common on many systems)
-		if sudo virsh pool-info images >/dev/null 2>&1; then
-			log_info "Using existing 'images' storage pool"
-			# We'll use the images pool instead of creating default
-		else
-			# Create default pool only if neither exists
-			log_info "Creating default storage pool..."
-			
-			# Ensure directory exists
-			sudo mkdir -p /var/lib/libvirt/images
-			
-			# Create temporary XML for storage pool
-			cat <<EOF > /tmp/default-pool.xml
-<pool type='dir'>
-  <name>default</name>
-  <target>
-    <path>/var/lib/libvirt/images</path>
-  </target>
-</pool>
-EOF
-			if sudo virsh pool-define /tmp/default-pool.xml >/dev/null 2>&1; then
-				sudo virsh pool-autostart default
-				sudo virsh pool-start default
-				log_success "Default storage pool created"
-			else
-				log_warn "Could not create default pool, will use images pool if available"
-			fi
-			rm -f /tmp/default-pool.xml
-		fi
-	fi
-
 	log_success "Libvirt setup verified"
-}
-
-check_provider_config() {
-	log_info "Checking cloud provider configuration..."
-
-	if [[ -z "${TF_VAR_ami_id:-}" && -z "${TF_VAR_project_id:-}" ]]; then
-		log_warn "No cloud provider configuration detected"
-		echo
-		echo "Please set provider-specific environment variables:"
-		echo
-		echo "For AWS:"
-		echo "  export TF_VAR_ami_id='ami-0c02fb55956c7d316'"
-		echo "  export TF_VAR_region='us-west-2'"
-		echo "  export TF_VAR_subnet_id='subnet-xxxxxxxxx'"
-		echo "  export TF_VAR_vpc_id='vpc-xxxxxxxxx'"
-		echo
-		echo "For GCP:"
-		echo "  export TF_VAR_project_id='your-gcp-project'"
-		echo "  export TF_VAR_region='us-central1'"
-		echo "  export TF_VAR_zone='us-central1-a'"
-		echo
-		exit 1
-	fi
-}
-
-generate_ssh_key() {
-	log_info "Generating RSA 4096 SSH keypair..."
-
-	if [[ -f "$TERRAFORM_DIR/private_key.pem" ]]; then
-		log_warn "SSH key already exists, skipping generation"
-		return 0
-	fi
-
-	ssh-keygen -t rsa -b 4096 -f "$TERRAFORM_DIR/private_key.pem" -N "" -C "tailscale-exit-node-$(date +%Y%m%d)"
-	chmod 600 "$TERRAFORM_DIR/private_key.pem"
-	chmod 644 "$TERRAFORM_DIR/private_key.pem.pub"
-
-	log_success "SSH keypair generated successfully"
 }
 
 run_terraform() {
@@ -291,42 +259,23 @@ run_terraform() {
 	fi
 
 	if ! terraform apply tfplan; then
+		rm -f tfplan
 		log_error "Terraform apply failed"
 		exit 1
 	fi
+	rm -f tfplan
 
 	log_success "Infrastructure provisioned successfully"
 }
 
-generate_ansible_inventory() {
-	log_info "Generating Ansible inventory..."
-
-	log_info "Script directory: $SCRIPT_DIR"
-	log_info "Project root: $PROJECT_ROOT"
-	log_info "Terraform directory: $TERRAFORM_DIR"
-	log_info "Current working directory: $(pwd)"
-	
-	if [[ ! -d "$TERRAFORM_DIR" ]]; then
-		log_error "Terraform directory not found: $TERRAFORM_DIR"
-		log_error "Directory contents of project root:"
-		ls -la "$PROJECT_ROOT" || echo "Cannot list project root"
+check_ansible_inventory() {
+	# terraform/main.tf renders ansible/inventory.ini.tpl; there is no second renderer.
+	if [[ ! -s "$ANSIBLE_DIR/inventory.ini" ]]; then
+		log_error "Ansible inventory was not generated by Terraform: $ANSIBLE_DIR/inventory.ini"
 		exit 1
 	fi
-
-	cd "$TERRAFORM_DIR"
-	local vm_ip
-	vm_ip=$(terraform output -raw vm_ip 2>/dev/null)
-
-	if [[ -z "$vm_ip" ]]; then
-		log_error "Could not retrieve VM IP from Terraform"
-		exit 1
-	fi
-
-	# Generate inventory from template
-	sed "s/VM_IP/$vm_ip/g; s/TAILSCALE_AUTH_KEY/$TAILSCALE_AUTH_KEY/g; s/VM_HOSTNAME/$VM_NAME/g; s/VM_USERNAME/$VM_USERNAME/g; s/VM_MEMORY/$MEMORY_MB/g; s/VM_VCPUS/$VCPU_COUNT/g" \
-		"$ANSIBLE_DIR/inventory.ini.tpl" > "$ANSIBLE_DIR/inventory.ini"
-
-	log_success "Ansible inventory generated for VM: $vm_ip"
+	chmod 600 "$ANSIBLE_DIR/inventory.ini" "$TERRAFORM_DIR/vm_key"
+	log_success "Ansible inventory ready"
 }
 
 wait_for_ssh() {
@@ -389,9 +338,9 @@ run_ansible() {
 
 	cd "$ANSIBLE_DIR"
 
-	# Build optional extra-vars to control handlers
-
-	if ! ansible-playbook -i inventory.ini playbook.yml -e disable_handlers=true; then
+	# The auth key reaches Ansible through the environment only; it is not
+	# written to the inventory, the cloud-init disk or the Terraform state.
+	if ! TAILSCALE_AUTH_KEY="$TAILSCALE_AUTH_KEY" ansible-playbook -i inventory.ini playbook.yml; then
 		log_error "Ansible playbook failed"
 		exit 1
 	fi
@@ -450,8 +399,9 @@ main() {
 	check_pre_deployment
 	check_libvirt
 	collect_user_input
+	check_network_free
 	run_terraform
-	generate_ansible_inventory
+	check_ansible_inventory
 	wait_for_ssh
 	run_ansible
 	display_results
