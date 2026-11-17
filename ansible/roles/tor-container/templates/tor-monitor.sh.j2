@@ -1,85 +1,55 @@
 #!/bin/bash
 
-set -euo pipefail
+# Tor container watchdog. Runs in the foreground under tor-monitor.service.
+# Health = a real request through Tor's SOCKS port. The container is only
+# restarted after several failures in a row, and not again during the grace
+# period that follows a restart (Tor needs time to bootstrap).
 
-readonly LOG_FILE="/var/log/tor-monitor.log"
-readonly TOR_CONTAINER="tor-proxy"
-readonly CHECK_INTERVAL=30
+set -uo pipefail
+
+readonly CHECK_INTERVAL=60
+readonly FAILURES_BEFORE_RESTART=5
+readonly RESTART_GRACE=300
 
 log_message() {
-    echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" | tee -a "$LOG_FILE"
+	echo "$(date '+%Y-%m-%d %H:%M:%S') - $1"
 }
 
-check_tor_container() {
-    if ! docker ps --filter "name=$TOR_CONTAINER" --filter "status=running" | grep -q "$TOR_CONTAINER"; then
-        log_message "ERROR: Tor container is not running"
-        return 1
-    fi
-    
-    if ! docker exec "$TOR_CONTAINER" nc -z localhost 9050 >/dev/null 2>&1; then
-        log_message "ERROR: Tor SOCKS port not responding"
-        return 1
-    fi
-    
-    if ! docker exec "$TOR_CONTAINER" nc -z localhost 9053 >/dev/null 2>&1; then
-        log_message "ERROR: Tor DNS port not responding"
-        return 1
-    fi
-    
-    return 0
+tor_healthy() {
+	curl -sf --max-time 30 --socks5-hostname 127.0.0.1:9050 https://check.torproject.org/api/ip |
+		grep -q '"IsTor":true'
 }
 
 restart_tor_container() {
-    log_message "Attempting to restart Tor container..."
-    
-    cd /opt/tor-proxy
-    docker compose down || true
-    sleep 5
-    docker compose up -d
-    
-    sleep 15
-    
-    if check_tor_container; then
-        log_message "Tor container successfully restarted"
-        return 0
-    else
-        log_message "ERROR: Failed to restart Tor container"
-        return 1
-    fi
-}
-
-monitor_tor_logs() {
-    local log_output
-    log_output=$(docker logs "$TOR_CONTAINER" --tail 10 2>&1 || echo "")
-    
-    if echo "$log_output" | grep -q "Bootstrapped 100%"; then
-        return 0
-    fi
-    
-    if echo "$log_output" | grep -qi "error\|failed\|critical"; then
-        log_message "ERROR: Critical error detected in Tor logs"
-        return 1
-    fi
-    
-    return 0
+	log_message "Restarting Tor container"
+	if ! docker compose --project-directory /opt/tor-proxy up -d --force-recreate; then
+		log_message "ERROR: docker compose up failed"
+	fi
 }
 
 main() {
-    log_message "Starting Tor container monitoring"
-    
-    while true; do
-        if ! check_tor_container || ! monitor_tor_logs; then
-            if ! restart_tor_container; then
-                log_message "CRITICAL: Unable to recover Tor container, waiting before retry"
-                sleep 300
-            fi
-        fi
-        
-        sleep "$CHECK_INTERVAL"
-    done
+	local failures=0
+	local last_restart=0
+
+	log_message "Starting Tor container monitoring"
+	while true; do
+		if tor_healthy; then
+			if [[ $failures -gt 0 ]]; then
+				log_message "Tor is healthy again after $failures failed checks"
+			fi
+			failures=0
+		else
+			failures=$((failures + 1))
+			log_message "WARNING: Tor health check failed ($failures/$FAILURES_BEFORE_RESTART)"
+			if [[ $failures -ge $FAILURES_BEFORE_RESTART ]] &&
+				[[ $(($(date +%s) - last_restart)) -ge $RESTART_GRACE ]]; then
+				restart_tor_container
+				last_restart=$(date +%s)
+				failures=0
+			fi
+		fi
+		sleep "$CHECK_INTERVAL"
+	done
 }
 
-if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
-    exec > >(tee -a "$LOG_FILE") 2>&1
-    main "$@" &
-fi
+main "$@"

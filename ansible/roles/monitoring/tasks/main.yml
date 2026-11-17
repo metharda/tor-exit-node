@@ -58,36 +58,36 @@
     dest: /usr/local/bin/tor-metrics.sh
     content: |
       #!/bin/bash
-      
+
       set -euo pipefail
-      
+
       METRICS_FILE="/var/lib/node_exporter/textfile_collector/tor.prom"
-      
+
       if docker ps --filter "name=tor-proxy" --filter "status=running" | grep -q tor-proxy; then
           echo "tor_container_running 1" > "$METRICS_FILE"
       else
           echo "tor_container_running 0" > "$METRICS_FILE"
       fi
-      
+
       if tailscale status >/dev/null 2>&1; then
           echo "tailscale_running 1" >> "$METRICS_FILE"
       else
           echo "tailscale_running 0" >> "$METRICS_FILE"
       fi
-      
-      if nc -z 172.20.0.10 9050 2>/dev/null; then
+
+      if curl -sf -m 30 --socks5-hostname 127.0.0.1:9050 https://check.torproject.org/api/ip | grep -q IsTor; then
           echo "tor_socks_port_open 1" >> "$METRICS_FILE"
       else
           echo "tor_socks_port_open 0" >> "$METRICS_FILE"
       fi
-      
-      if dig +time=2 +tries=1 @172.20.0.10 -p 9053 example.com A >/dev/null 2>&1; then
+
+      if dig +time=2 +tries=1 @127.0.0.1 -p 9053 example.com A >/dev/null 2>&1; then
         echo "tor_dns_port_open 1" >> "$METRICS_FILE"
       else
         echo "tor_dns_port_open 0" >> "$METRICS_FILE"
       fi
-      
-      IPTABLES_RULES=$(iptables -t nat -L TORPROXY 2>/dev/null | wc -l)
+
+      IPTABLES_RULES=$(iptables -t nat -S TORPROXY_OUT 2>/dev/null | wc -l)
       echo "transparent_proxy_rules_count $IPTABLES_RULES" >> "$METRICS_FILE"
     mode: '0755'
     owner: root
@@ -112,32 +112,32 @@
     dest: /usr/local/bin/alert-check.sh
     content: |
       #!/bin/bash
-      
+
       set -euo pipefail
-      
+
       LOG_FILE="/var/log/alert-check.log"
-      
+
       log_alert() {
           echo "$(date '+%Y-%m-%d %H:%M:%S') ALERT: $1" | tee -a "$LOG_FILE"
       }
-      
+
       if ! docker ps --filter "name=tor-proxy" --filter "status=running" | grep -q tor-proxy; then
           log_alert "Tor container is not running"
       fi
-      
+
       if ! tailscale status >/dev/null 2>&1; then
           log_alert "Tailscale is not running"
       fi
-      
-      if ! nc -z 172.20.0.10 9050 2>/dev/null; then
+
+      if ! curl -sf -m 30 --socks5-hostname 127.0.0.1:9050 https://check.torproject.org/api/ip | grep -q IsTor; then
           log_alert "Tor SOCKS port is not accessible"
       fi
-      
-      if ! dig +time=2 +tries=1 @172.20.0.10 -p 9053 example.com A >/dev/null 2>&1; then
+
+      if ! dig +time=2 +tries=1 @127.0.0.1 -p 9053 example.com A >/dev/null 2>&1; then
         log_alert "Tor DNS (UDP 9053) is not accessible"
       fi
-      
-      IPTABLES_RULES=$(iptables -t nat -L TORPROXY 2>/dev/null | wc -l)
+
+      IPTABLES_RULES=$(iptables -t nat -S TORPROXY_OUT 2>/dev/null | wc -l)
       if [ "$IPTABLES_RULES" -lt 5 ]; then
           log_alert "Transparent proxy rules missing or incomplete"
       fi

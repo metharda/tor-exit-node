@@ -6,7 +6,6 @@ readonly LOG_FILE="/var/log/tor-watchdog.log"
 readonly TOR_CONTAINER="tor-proxy"
 readonly CHECK_INTERVAL=60
 readonly RESTART_THRESHOLD=3
-readonly CIRCUIT_CHECK_INTERVAL=300
 
 CONSECUTIVE_FAILURES=0
 
@@ -31,74 +30,30 @@ check_container_health() {
 	return 0
 }
 
+# The Tor container uses host networking: SOCKS is on 127.0.0.1:9050 and
+# DNSPort is UDP 9053 (checked with dig, not a TCP probe). ControlPort is off.
 check_tor_connectivity() {
-	if ! docker exec "$TOR_CONTAINER" nc -z localhost 9050 >/dev/null 2>&1; then
-		log_message "ERROR: Tor SOCKS port not responding"
+	if ! curl -sf --max-time 30 --socks5-hostname 127.0.0.1:9050 https://check.torproject.org/api/ip | grep -q '"IsTor":true'; then
+		log_message "ERROR: No working circuit through Tor SOCKS"
 		return 1
 	fi
 
-	if ! docker exec "$TOR_CONTAINER" nc -z localhost 9053 >/dev/null 2>&1; then
-		log_message "ERROR: Tor DNS port not responding"
+	if ! dig +time=10 +tries=1 @127.0.0.1 -p 9053 check.torproject.org A +short | grep -q .; then
+		log_message "ERROR: Tor DNSPort (UDP 9053) not answering"
 		return 1
 	fi
 
-	return 0
-}
-
-check_tor_circuits() {
-	local circuit_info
-	circuit_info=$(timeout 10 docker exec "$TOR_CONTAINER" sh -c "echo 'GETINFO circuit-status' | nc localhost 9051" 2>/dev/null || echo "")
-
-	if [[ -z "$circuit_info" ]]; then
-		log_message "WARNING: Cannot retrieve circuit information"
-		return 1
-	fi
-
-	local built_circuits
-	built_circuits=$(echo "$circuit_info" | grep -c "BUILT" || echo "0")
-
-	if [[ $built_circuits -lt 3 ]]; then
-		log_message "WARNING: Only $built_circuits circuits built (minimum 3 recommended)"
-		return 1
-	fi
-
-	log_message "INFO: $built_circuits circuits built and operational"
 	return 0
 }
 
 check_tor_bootstrap() {
-	local bootstrap_info
-	bootstrap_info=$(docker logs "$TOR_CONTAINER" --tail 10 2>/dev/null | grep "Bootstrapped" | tail -1 || echo "")
-
-	if echo "$bootstrap_info" | grep -q "100%"; then
+	# Tor logs "Bootstrapped 100%" once per start; look at the whole log of this container.
+	if docker logs "$TOR_CONTAINER" 2>&1 | grep -q "Bootstrapped 100%"; then
 		return 0
 	else
 		log_message "WARNING: Tor bootstrap may not be complete"
 		return 1
 	fi
-}
-
-check_tor_logs_for_errors() {
-	local recent_logs
-	recent_logs=$(docker logs "$TOR_CONTAINER" --since 5m 2>&1 || echo "")
-
-	local critical_errors=(
-		"Connection refused"
-		"Circuit establish timeout"
-		"Failed to find node"
-		"Directory server failure"
-		"Consensus not signed"
-		"Clock skew"
-	)
-
-	for error in "${critical_errors[@]}"; do
-		if echo "$recent_logs" | grep -qi "$error"; then
-			log_message "ERROR: Critical error detected in logs: $error"
-			return 1
-		fi
-	done
-
-	return 0
 }
 
 restart_tor_container() {
@@ -110,7 +65,7 @@ restart_tor_container() {
 	}
 
 	docker compose down || {
-		log_message "WARNING: docker-compose down failed, forcing stop"
+		log_message "WARNING: docker compose down failed, forcing stop"
 		docker stop "$TOR_CONTAINER" 2>/dev/null || true
 		docker rm "$TOR_CONTAINER" 2>/dev/null || true
 	}
@@ -155,10 +110,6 @@ perform_health_checks() {
 		health_ok=false
 	fi
 
-	if ! check_tor_logs_for_errors; then
-		health_ok=false
-	fi
-
 	if [[ "$health_ok" == "true" ]]; then
 		if [[ $CONSECUTIVE_FAILURES -gt 0 ]]; then
 			log_message "INFO: Tor container recovered, resetting failure count"
@@ -173,16 +124,11 @@ perform_health_checks() {
 }
 
 monitor_transparent_proxy() {
-	local iptables_rules
-	iptables_rules=$(iptables -t nat -L TORPROXY 2>/dev/null | grep -c "REDIRECT\|RETURN" || echo "0")
-
-	if [[ $iptables_rules -lt 5 ]]; then
+	if ! iptables -t nat -S TORPROXY_OUT 2>/dev/null | grep -q -- '--to-ports 9040'; then
 		log_message "ERROR: Transparent proxy rules missing or incomplete"
 
-		if [[ -x "/opt/iptables-rules.sh" ]]; then
-			log_message "Attempting to restore iptables rules..."
-			/opt/iptables-rules.sh
-		fi
+		log_message "Attempting to restore iptables rules..."
+		systemctl restart transparent-proxy.service || true
 	fi
 }
 
@@ -218,10 +164,6 @@ main() {
 
 		monitor_transparent_proxy
 
-		if [[ $((RANDOM % (CIRCUIT_CHECK_INTERVAL / CHECK_INTERVAL))) -eq 0 ]]; then
-			check_tor_circuits || true
-		fi
-
 		sleep $CHECK_INTERVAL
 	done
 }
@@ -239,7 +181,6 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
 		exit 1
 	fi
 
-	exec > >(tee -a "$LOG_FILE") 2>&1
-	main "$@" &
-	wait
+	# Stays in the foreground so systemd (or the caller) supervises it.
+	main "$@"
 fi

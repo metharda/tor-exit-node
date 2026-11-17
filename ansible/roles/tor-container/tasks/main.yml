@@ -61,3 +61,39 @@
   retries: 5
   delay: 10
   changed_when: false
+
+- name: Install Tor monitor script
+  template:
+    src: tor-monitor.sh.j2
+    dest: /usr/local/bin/tor-monitor.sh
+    mode: '0755'
+    owner: root
+    group: root
+  notify: restart tor-monitor
+
+- name: Install Tor monitor service
+  copy:
+    dest: /etc/systemd/system/tor-monitor.service
+    mode: '0644'
+    content: |
+      [Unit]
+      Description=Tor container watchdog
+      After=docker.service
+      Wants=docker.service
+
+      [Service]
+      Type=simple
+      ExecStart=/usr/local/bin/tor-monitor.sh
+      Restart=always
+      RestartSec=30
+
+      [Install]
+      WantedBy=multi-user.target
+  notify: restart tor-monitor
+
+- name: Enable and start Tor monitor
+  systemd:
+    name: tor-monitor
+    enabled: true
+    state: started
+    daemon_reload: true

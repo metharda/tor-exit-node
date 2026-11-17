@@ -103,7 +103,7 @@ test_tor_container() {
 	fi
 
 	log_info "Testing Tor SOCKS connectivity..."
-	if ssh -i "$SSH_KEY" -o StrictHostKeyChecking=no "$VM_USERNAME@$VM_IP" "nc -z 172.20.0.10 9050" 2>/dev/null; then
+	if ssh -i "$SSH_KEY" -o StrictHostKeyChecking=no "$VM_USERNAME@$VM_IP" "curl -sf --max-time 30 --socks5-hostname 127.0.0.1:9050 https://check.torproject.org/api/ip | grep -q '\"IsTor\":true'" 2>/dev/null; then
 		log_success "Tor SOCKS port is accessible"
 	else
 		log_error "Tor SOCKS port is not accessible"
@@ -111,7 +111,7 @@ test_tor_container() {
 	fi
 
 	log_info "Testing Tor DNS connectivity..."
-	if ssh -i "$SSH_KEY" -o StrictHostKeyChecking=no "$VM_USERNAME@$VM_IP" "nc -z 172.20.0.10 9053" 2>/dev/null; then
+	if ssh -i "$SSH_KEY" -o StrictHostKeyChecking=no "$VM_USERNAME@$VM_IP" "dig +time=10 +tries=1 @127.0.0.1 -p 9053 check.torproject.org A +short | grep -q ." 2>/dev/null; then
 		log_success "Tor DNS port is accessible"
 	else
 		log_error "Tor DNS port is not accessible"
@@ -123,7 +123,7 @@ test_transparent_proxy() {
 	log_info "Checking transparent proxy configuration..."
 
 	local iptables_output
-	iptables_output=$(ssh -i "$SSH_KEY" -o StrictHostKeyChecking=no "$VM_USERNAME@$VM_IP" "sudo iptables -t nat -L TORPROXY -n -v" 2>/dev/null || echo "")
+	iptables_output=$(ssh -i "$SSH_KEY" -o StrictHostKeyChecking=no "$VM_USERNAME@$VM_IP" "sudo iptables -t nat -S TORPROXY_PRE; sudo iptables -t nat -S TORPROXY_OUT" 2>/dev/null || echo "")
 
 	if [[ -n "$iptables_output" ]]; then
 		log_success "Transparent proxy iptables rules are configured"
@@ -197,14 +197,11 @@ test_monitoring() {
 test_security_hardening() {
 	log_info "Checking security hardening..."
 
-	log_info "Checking UFW firewall status..."
-	local ufw_status
-	ufw_status=$(ssh -i "$SSH_KEY" -o StrictHostKeyChecking=no "$VM_USERNAME@$VM_IP" "sudo ufw status" 2>/dev/null || echo "")
-
-	if echo "$ufw_status" | grep -q "Status: active"; then
-		log_success "UFW firewall is active"
+	log_info "Checking firewall (iptables owns it, UFW stays off)..."
+	if ssh -i "$SSH_KEY" -o StrictHostKeyChecking=no "$VM_USERNAME@$VM_IP" "sudo systemctl is-active transparent-proxy" 2>/dev/null | grep -qx "active"; then
+		log_success "transparent-proxy firewall rules are loaded"
 	else
-		log_warn "UFW firewall may not be active"
+		log_warn "transparent-proxy service is not active"
 	fi
 
 	log_info "Checking fail2ban status..."
@@ -241,8 +238,8 @@ run_leak_tests() {
 	echo "   (Should show Tor exit node IP, not your real IP)"
 	echo
 	echo "4. Test DNS leak:"
-	echo "   dig @1.1.1.1 google.com"
-	echo "   (Should timeout - external DNS blocked)"
+	echo "   dig @9.9.9.9 example.com"
+	echo "   (Answered through Tor or not at all - UDP 53 is redirected to Tor DNSPort)"
 	echo
 	echo "5. Test IPv6 leak:"
 	echo "   curl -6 https://ipv6.google.com"
@@ -253,7 +250,7 @@ run_leak_tests() {
 	log_info "Server-side routing verification:"
 
 	local routing_test
-	routing_test=$(ssh -i "$SSH_KEY" -o StrictHostKeyChecking=no "$VM_USERNAME@$VM_IP" "curl -s --socks5 172.20.0.10:9050 https://check.torproject.org | grep -c 'Congratulations' || echo '0'")
+	routing_test=$(ssh -i "$SSH_KEY" -o StrictHostKeyChecking=no "$VM_USERNAME@$VM_IP" "curl -s --socks5-hostname 127.0.0.1:9050 https://check.torproject.org | grep -c 'Congratulations' || echo '0'")
 
 	if [[ "$routing_test" -gt 0 ]]; then
 		log_success "Server can route traffic through Tor successfully"
@@ -285,10 +282,10 @@ generate_verification_report() {
             sudo docker ps --filter 'name=tor-proxy' --format 'table {{.Names}}\t{{.Status}}' || echo '    Not running'
             echo
             echo '  System Services:'
-            sudo systemctl is-active tailscaled docker ufw fail2ban node_exporter | paste <(echo -e 'tailscaled\ndocker\nufw\nfail2ban\nnode_exporter') - | column -t
+            sudo systemctl is-active tailscaled docker transparent-proxy tor-monitor fail2ban | paste <(echo -e 'tailscaled\ndocker\ntransparent-proxy\ntor-monitor\nfail2ban') - | column -t
             echo
             echo '  Transparent Proxy Rules:'
-            sudo iptables -t nat -L TORPROXY -n --line-numbers | head -10 || echo '    Not configured'
+            sudo iptables -t nat -S TORPROXY_PRE || echo '    Not configured'
         "
 	} >"$report_file"
 

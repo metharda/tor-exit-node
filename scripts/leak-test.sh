@@ -54,7 +54,7 @@ test_server_side_routing() {
 
 	local tor_check
 	tor_check=$(ssh -i "$SSH_KEY" -o StrictHostKeyChecking=no "$VM_USERNAME@$VM_IP" \
-		"curl -s --socks5 172.20.0.10:9050 https://check.torproject.org" 2>/dev/null || echo "")
+		"curl -s --socks5-hostname 127.0.0.1:9050 https://check.torproject.org" 2>/dev/null || echo "")
 
 	if echo "$tor_check" | grep -q "Congratulations"; then
 		log_success "Server can route traffic through Tor"
@@ -80,16 +80,17 @@ test_dns_leak_prevention() {
 		echo "$resolv_conf"
 	fi
 
-	log_info "Testing external DNS blocking..."
-	local dns_block_test
-	dns_block_test=$(ssh -i "$SSH_KEY" -o StrictHostKeyChecking=no "$VM_USERNAME@$VM_IP" \
-		"timeout 5 dig @8.8.8.8 google.com 2>&1 || echo 'BLOCKED'" 2>/dev/null)
+	# A query aimed at a public resolver is redirected to Tor's DNSPort, so it is
+	# either answered through Tor or not at all; it never leaves the VM directly.
+	log_info "Testing that direct DNS queries are redirected to Tor..."
+	local dns_redirect_rule
+	dns_redirect_rule=$(ssh -i "$SSH_KEY" -o StrictHostKeyChecking=no "$VM_USERNAME@$VM_IP" \
+		"sudo iptables -t nat -S TORPROXY_OUT | grep -c -- '--dport 53 -j REDIRECT --to-ports 9053'" 2>/dev/null || echo "0")
 
-	if echo "$dns_block_test" | grep -q "BLOCKED\|timeout\|connection timed out"; then
-		log_success "External DNS queries are blocked"
+	if [[ "$dns_redirect_rule" -gt 0 ]]; then
+		log_success "UDP 53 is redirected to Tor DNSPort (try: dig @9.9.9.9 example.com)"
 	else
-		log_warn "External DNS queries may not be properly blocked"
-		echo "DNS test result: $dns_block_test"
+		log_warn "UDP 53 redirect to Tor DNSPort is missing"
 	fi
 }
 
@@ -122,7 +123,7 @@ test_transparent_proxy_rules() {
 
 	local iptables_rules
 	iptables_rules=$(ssh -i "$SSH_KEY" -o StrictHostKeyChecking=no "$VM_USERNAME@$VM_IP" \
-		"sudo iptables -t nat -L TORPROXY -n" 2>/dev/null || echo "")
+		"sudo iptables -t nat -S TORPROXY_PRE; sudo iptables -t nat -S TORPROXY_OUT" 2>/dev/null || echo "")
 
 	if [[ -n "$iptables_rules" ]]; then
 		local redirect_rules
@@ -135,16 +136,16 @@ test_transparent_proxy_rules() {
 			return 1
 		fi
 	else
-		log_error "TORPROXY chain not found in iptables"
+		log_error "TORPROXY_PRE/TORPROXY_OUT chains not found in iptables"
 		return 1
 	fi
 
 	local tailscale_blocks
 	tailscale_blocks=$(ssh -i "$SSH_KEY" -o StrictHostKeyChecking=no "$VM_USERNAME@$VM_IP" \
-		"sudo iptables -L OUTPUT -n | grep -c '100.64.0.0/10.*DROP' || echo '0'" 2>/dev/null)
+		"sudo iptables -S TORPROXY_FWD | grep -c -- '-A TORPROXY_FWD -j DROP' || echo '0'" 2>/dev/null)
 
 	if [[ $tailscale_blocks -gt 0 ]]; then
-		log_success "Tailscale direct exit blocking is configured"
+		log_success "Client traffic is never forwarded (TORPROXY_FWD drops everything)"
 	else
 		log_warn "Tailscale direct exit blocking may not be configured"
 	fi
@@ -202,9 +203,8 @@ run_client_instructions() {
 	echo "   curl https://ipinfo.io"
 	echo "   curl https://icanhazip.com"
 	echo
-	echo "4. Test DNS leak (should timeout/fail):"
-	echo "   dig @1.1.1.1 google.com"
-	echo "   dig @8.8.8.8 google.com"
+	echo "4. Test DNS leak (answered through Tor or not at all; never by the resolver directly):"
+	echo "   dig @9.9.9.9 example.com"
 	echo
 	echo "5. Test IPv6 leak (should fail):"
 	echo "   curl -6 https://ipv6.google.com"
@@ -264,7 +264,7 @@ generate_leak_test_report() {
             docker ps --filter 'name=tor-proxy' --format 'table {{.Names}}\t{{.Status}}\t{{.Ports}}' 2>/dev/null || echo 'Not running'
             echo
             echo 'Transparent Proxy Rules:'
-            sudo iptables -t nat -L TORPROXY -n --line-numbers 2>/dev/null | head -10 || echo 'Not configured'
+            sudo iptables -t nat -S TORPROXY_PRE 2>/dev/null || echo 'Not configured'
             echo
             echo 'DNS Configuration:'
             cat /etc/resolv.conf
@@ -311,7 +311,7 @@ main() {
 	log_info "Security reminders:"
 	echo "  - Always verify Tor routing from client: curl https://check.torproject.org"
 	echo "  - Monitor for IP leaks: curl https://ipinfo.io"
-	echo "  - Test DNS leaks: dig @8.8.8.8 google.com (should timeout)"
+	echo "  - Test DNS leaks: dig @9.9.9.9 example.com (answered through Tor or not at all)"
 	echo "  - Verify IPv6 is blocked: curl -6 https://ipv6.google.com (should fail)"
 
 	exit $server_test_results
