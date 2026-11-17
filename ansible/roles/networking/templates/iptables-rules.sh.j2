@@ -1,84 +1,94 @@
 #!/bin/bash
+# Transparent Tor proxy rules for the exit node.
+#
+# Only the project's own chains (TORPROXY_*) are replaced; the built-in chains
+# are never flushed. Each table is loaded with one iptables-restore --noflush,
+# so a chain is never seen half-filled, and every jump is added once, so
+# running this script again gives the same ruleset.
+#
+#   nat    PREROUTING -i tailscale0 -> TORPROXY_PRE  client TCP -> TransPort, UDP 53 -> DNSPort
+#   nat    OUTPUT                   -> TORPROXY_OUT  the VM's own TCP -> TransPort, UDP 53 -> DNSPort
+#   filter INPUT                    -> TORPROXY_IN   Tor ports only from tailscale0 and lo
+#   filter OUTPUT                   -> TORPROXY_EGR  the VM's own non-Tor traffic is dropped
+#   filter FORWARD                  -> TORPROXY_FWD  nothing is forwarded (ip_forward stays 0)
 
 set -euo pipefail
 
-echo "Applying transparent proxy iptables rules (DNS-less mode)..."
+readonly TOR_UID={{ tor_uid }}
+readonly TRANS_PORT=9040
+readonly DNS_PORT=9053
+readonly SOCKS_PORT=9050
+readonly TS_IF=tailscale0
+# tailscaled marks its own sockets (control, DERP, WireGuard) with this fwmark.
+readonly TS_BYPASS_MARK=0x80000/0xff0000
 
-TOR_SOCKS_PORT=9050
-TOR_TRANS_PORT=9040
-TOR_CONTAINER_IP=172.20.0.10
-TAILSCALE_NETWORK=100.64.0.0/10
+# Insert a jump at the top of a built-in chain unless it is already there.
+ensure_jump() {
+	local cmd=$1 table=$2 parent=$3
+	shift 3
+	"$cmd" -w -t "$table" -C "$parent" "$@" 2>/dev/null || "$cmd" -w -t "$table" -I "$parent" 1 "$@"
+}
 
-echo "Flushing existing NAT rules..."
-iptables -t nat -F
-iptables -t nat -X 2>/dev/null || true
+iptables-restore -w --noflush <<RULES
+*nat
+:TORPROXY_PRE - [0:0]
+-A TORPROXY_PRE -p udp --dport 53 -j REDIRECT --to-ports $DNS_PORT
+# Connections to the VM itself (SSH over the tailnet, peerapi/MagicDNS) stay local.
+-A TORPROXY_PRE -p tcp -m addrtype --dst-type LOCAL -j RETURN
+# Everything else, including 10.192.0.0/10 automap addresses and private ranges, goes into Tor.
+-A TORPROXY_PRE -p tcp --syn -j REDIRECT --to-ports $TRANS_PORT
+:TORPROXY_OUT - [0:0]
+-A TORPROXY_OUT -m owner --uid-owner $TOR_UID -j RETURN
+-A TORPROXY_OUT -p udp --dport 53 -j REDIRECT --to-ports $DNS_PORT
+-A TORPROXY_OUT -m mark --mark $TS_BYPASS_MARK -j RETURN
+-A TORPROXY_OUT -m addrtype --dst-type LOCAL -j RETURN
+-A TORPROXY_OUT -p tcp --syn -j REDIRECT --to-ports $TRANS_PORT
+COMMIT
+*filter
+:TORPROXY_IN - [0:0]
+-A TORPROXY_IN -i lo -j RETURN
+-A TORPROXY_IN -i $TS_IF -p tcp --dport $TRANS_PORT -j RETURN
+-A TORPROXY_IN -i $TS_IF -p udp --dport $DNS_PORT -j RETURN
+-A TORPROXY_IN -p tcp -m multiport --dports $TRANS_PORT,$SOCKS_PORT,$DNS_PORT -j DROP
+-A TORPROXY_IN -p udp --dport $DNS_PORT -j DROP
+:TORPROXY_EGR - [0:0]
+-A TORPROXY_EGR -o lo -j RETURN
+# Replies to connections opened from outside (SSH on the management interface, tailnet clients).
+-A TORPROXY_EGR -m conntrack --ctstate ESTABLISHED,RELATED --ctdir REPLY -j RETURN
+-A TORPROXY_EGR -m owner --uid-owner $TOR_UID -j RETURN
+-A TORPROXY_EGR -m mark --mark $TS_BYPASS_MARK -j RETURN
+# DHCP on the libvirt network.
+-A TORPROXY_EGR -p udp --sport 68 --dport 67 -j RETURN
+-A TORPROXY_EGR -j DROP
+:TORPROXY_FWD - [0:0]
+-A TORPROXY_FWD -j DROP
+COMMIT
+RULES
 
-ip6tables -t nat -F 2>/dev/null || true
-ip6tables -t nat -X 2>/dev/null || true
+ensure_jump iptables nat PREROUTING -i "$TS_IF" -j TORPROXY_PRE
+ensure_jump iptables nat OUTPUT -j TORPROXY_OUT
+ensure_jump iptables filter INPUT -j TORPROXY_IN
+ensure_jump iptables filter OUTPUT -j TORPROXY_EGR
+ensure_jump iptables filter FORWARD -j TORPROXY_FWD
+iptables -w -P FORWARD DROP
 
-echo "Creating TORPROXY chain..."
-iptables -t nat -N TORPROXY 2>/dev/null || true
+# IPv6: nothing in or out except loopback.
+ip6tables-restore -w --noflush <<RULES
+*filter
+:TORPROXY6_IN - [0:0]
+-A TORPROXY6_IN -i lo -j ACCEPT
+:TORPROXY6_OUT - [0:0]
+-A TORPROXY6_OUT -o lo -j ACCEPT
+COMMIT
+RULES
+ensure_jump ip6tables filter INPUT -j TORPROXY6_IN
+ensure_jump ip6tables filter OUTPUT -j TORPROXY6_OUT
+ip6tables -w -P INPUT DROP
+ip6tables -w -P OUTPUT DROP
+ip6tables -w -P FORWARD DROP
 
-# Exclude local traffic
-iptables -t nat -A TORPROXY -d 127.0.0.0/8 -j RETURN
-iptables -t nat -A TORPROXY -d 10.0.0.0/8 -j RETURN
-iptables -t nat -A TORPROXY -d 172.16.0.0/12 -j RETURN
-iptables -t nat -A TORPROXY -d 192.168.0.0/16 -j RETURN
-iptables -t nat -A TORPROXY -d 169.254.0.0/16 -j RETURN
-iptables -t nat -A TORPROXY -d 224.0.0.0/4 -j RETURN
-iptables -t nat -A TORPROXY -d 240.0.0.0/4 -j RETURN
+# All client traffic is REDIRECTed to local ports, so nothing needs forwarding.
+sysctl -q -w net.ipv4.ip_forward=0
+sysctl -q -w net.ipv6.conf.all.forwarding=0
 
-# Exclude essential services
-iptables -t nat -A TORPROXY -p tcp --dport 22 -j RETURN
-iptables -t nat -A TORPROXY -p tcp --dport 41641 -j RETURN
-iptables -t nat -A TORPROXY -p udp --dport 41641 -j RETURN
-
-# Exclude connections FROM the Tor container (prevent loops)
-iptables -t nat -A TORPROXY -s $TOR_CONTAINER_IP -j RETURN
-
-# Redirect TCP traffic to Tor TransPort
-iptables -t nat -A TORPROXY -p tcp -j REDIRECT --to-ports $TOR_TRANS_PORT
-
-# Apply transparent proxy to Tailscale traffic
-iptables -t nat -A OUTPUT -s $TAILSCALE_NETWORK -p tcp -j TORPROXY
-iptables -t nat -A PREROUTING -i tailscale0 -p tcp -j TORPROXY
-
-echo "Allowing local and Tailscale traffic..."
-iptables -A INPUT -i lo -j ACCEPT
-iptables -A OUTPUT -o lo -j ACCEPT
-iptables -A INPUT -i tailscale0 -j ACCEPT
-iptables -A OUTPUT -o tailscale0 -j ACCEPT
-
-echo "Transparent proxy rules applied successfully (without DNS redirection)"
-
-# Allow docker bridge traffic
-iptables -A FORWARD -i tailscale0 -o docker0 -j ACCEPT
-iptables -A FORWARD -i docker0 -o tailscale0 -j ACCEPT
-
-# Allow specific outbound connections
-iptables -A OUTPUT -d $TOR_CONTAINER_IP -p tcp --dport $TOR_SOCKS_PORT -j ACCEPT
-iptables -A OUTPUT -p tcp --dport 80 -j ACCEPT
-iptables -A OUTPUT -p tcp --dport 443 -j ACCEPT
-iptables -A OUTPUT -p tcp --dport 22 -j ACCEPT
-iptables -A OUTPUT -p udp --dport 53 -j ACCEPT
-iptables -A OUTPUT -p udp --dport 123 -j ACCEPT
-iptables -A OUTPUT -p udp --dport 41641 -j ACCEPT
-
-# Drop other Tailscale traffic not going through Tor
-iptables -A OUTPUT -s $TAILSCALE_NETWORK -j DROP
-
-# Allow everything else
-iptables -A OUTPUT -j ACCEPT
-
-# IPv6 rules (restrictive)
-ip6tables -P INPUT DROP
-ip6tables -P FORWARD DROP
-ip6tables -P OUTPUT DROP
-ip6tables -A INPUT -i lo -j ACCEPT
-ip6tables -A OUTPUT -o lo -j ACCEPT
-
-echo "Transparent proxy iptables rules applied successfully"
-iptables -t nat -L -n -v
-echo "IPv6 blocked completely"
-
-echo "Transparent proxy iptables redirection active (no socat needed)"
+echo "Transparent proxy rules applied (Tor UID $TOR_UID)"

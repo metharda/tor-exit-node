@@ -2,12 +2,9 @@
 - name: Install essential packages
   apt:
     name:
-      - ufw
       - fail2ban
       - unattended-upgrades
       - apt-listchanges
-      - iptables-persistent
-      - netfilter-persistent
       - curl
       - wget
       - htop
@@ -88,21 +85,12 @@
     name: root
     password_lock: true
 
-- name: Configure UFW default policies
-  template:
-    src: ufw-rules.sh.j2
-    dest: /tmp/ufw-rules.sh
-    mode: '0755'
-
-- name: Apply UFW rules
-  command: /tmp/ufw-rules.sh
+# iptables owns the firewall (networking role); UFW stays off.
+- name: Keep UFW disabled
+  command: ufw --force disable
+  register: ufw_disable
   changed_when: false
-
-- name: Enable UFW
-  ufw:
-    state: enabled
-    policy: deny
-    direction: incoming
+  failed_when: false
 
 - name: Configure fail2ban for SSH
   copy:
@@ -112,7 +100,7 @@
       bantime = 3600
       findtime = 600
       maxretry = 5
-      
+
       [sshd]
       enabled = true
       port = 22
@@ -140,19 +128,17 @@
     state: present
     reload: true
   loop:
-    - { key: "net.ipv4.ip_forward", value: "1" }
-    - { key: "net.ipv4.conf.all.forwarding", value: "1" }
-    - { key: "net.ipv4.conf.all.send_redirects", value: "0" }
-    - { key: "net.ipv4.conf.default.send_redirects", value: "0" }
-    - { key: "net.ipv4.conf.all.accept_redirects", value: "0" }
-    - { key: "net.ipv4.conf.default.accept_redirects", value: "0" }
-    - { key: "net.ipv4.conf.all.secure_redirects", value: "0" }
-    - { key: "net.ipv4.conf.default.secure_redirects", value: "0" }
-    - { key: "net.ipv4.icmp_echo_ignore_broadcasts", value: "1" }
-    - { key: "net.ipv4.icmp_ignore_bogus_error_responses", value: "1" }
-    - { key: "net.ipv4.tcp_syncookies", value: "1" }
-    - { key: "net.ipv4.conf.all.rp_filter", value: "2" }
-    - { key: "net.ipv4.conf.default.rp_filter", value: "2" }
+    - {key: "net.ipv4.conf.all.send_redirects", value: "0"}
+    - {key: "net.ipv4.conf.default.send_redirects", value: "0"}
+    - {key: "net.ipv4.conf.all.accept_redirects", value: "0"}
+    - {key: "net.ipv4.conf.default.accept_redirects", value: "0"}
+    - {key: "net.ipv4.conf.all.secure_redirects", value: "0"}
+    - {key: "net.ipv4.conf.default.secure_redirects", value: "0"}
+    - {key: "net.ipv4.icmp_echo_ignore_broadcasts", value: "1"}
+    - {key: "net.ipv4.icmp_ignore_bogus_error_responses", value: "1"}
+    - {key: "net.ipv4.tcp_syncookies", value: "1"}
+    - {key: "net.ipv4.conf.all.rp_filter", value: "2"}
+    - {key: "net.ipv4.conf.default.rp_filter", value: "2"}
 
 - name: Create systemd drop-in directory for hardening
   file:
@@ -192,6 +178,5 @@
     state: started
     enabled: true
   loop:
-    - ufw
     - fail2ban
     - unattended-upgrades

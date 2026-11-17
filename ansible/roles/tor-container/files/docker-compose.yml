@@ -1,33 +1,23 @@
-version: '3.8'
-
 services:
   tor-proxy:
     build:
       context: .
       dockerfile: Dockerfile
+      # Build steps share the VM's network, so they follow the same Tor rules.
+      network: host
+    image: tor-proxy:local
     container_name: tor-proxy
     restart: unless-stopped
-    expose:
-      - "9040"
-      - "9050" 
-      - "9053"
-    networks:
-      tor-network:
-        ipv4_address: 172.20.0.10
+    # Host networking: TransPort must see the original destination from the
+    # VM's own NAT table. No Docker network is created.
+    network_mode: host
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
     volumes:
       - tor-data:/var/lib/tor
-    environment:
-      - TOR_LOG_LEVEL=notice
-    healthcheck:
-      test: ["CMD", "nc", "-z", "127.0.0.1", "9050"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 60s
-
-networks:
-  tor-network:
-    external: true
 
 volumes:
   tor-data:
