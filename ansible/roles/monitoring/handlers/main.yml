@@ -2,10 +2,8 @@
 - name: reload systemd
   systemd:
     daemon_reload: true
-  when: not (disable_handlers | default(false))
 
 - name: restart node_exporter
   systemd:
     name: node_exporter
     state: restarted
-  when: not (disable_handlers | default(false))

@@ -48,47 +48,13 @@
     - system-hardening
     - docker
     - tor-container  # First setup secure Tor proxy
-    - networking     # Configure transparent proxy iptables 
+    - networking     # Configure transparent proxy iptables
     - tailscale      # Then setup Tailscale exit node
     #- monitoring
 
   post_tasks:
     - name: Apply pending handler changes before verification
       meta: flush_handlers
-
-    - name: Ensure transparent-proxy is started and enabled
-      systemd:
-        name: transparent-proxy
-        state: started
-        enabled: true
-
-    - name: Verify tor transparent proxy setup
-      shell: |
-        # Check if transparent-proxy service is active
-        systemctl is-active transparent-proxy.service
-      register: tor_proxy_status
-      failed_when: tor_proxy_status.stdout != "active"
-
-    - name: Verify Docker Tor container
-      docker_container_info:
-        name: tor-proxy
-      register: tor_container_info
-      failed_when: not tor_container_info.exists or tor_container_info.container.State.Status != "running"
-
-    - name: Check iptables transparent proxy rules
-      shell: |
-        iptables -t nat -L OUTPUT | grep -q "REDIRECT.*9040"
-      register: iptables_check
-      failed_when: iptables_check.rc != 0
-
-    - name: Test Tor connectivity
-      uri:
-        url: https://check.torproject.org/api/ip
-        method: GET
-        timeout: 30
-      register: tor_test
-      retries: 3
-      delay: 10
 
     - name: Verify services are running
       systemd:
@@ -98,8 +64,29 @@
       loop:
         - docker
         - tailscaled
-        - ufw
         - transparent-proxy
+        - tor-monitor
+
+    - name: Verify Docker Tor container
+      command: docker inspect -f '{{ "{{" }} .State.Status {{ "}}" }}' tor-proxy
+      register: tor_container_state
+      changed_when: false
+      failed_when: tor_container_state.stdout != "running"
+
+    - name: Check iptables transparent proxy rules
+      shell: iptables -t nat -S TORPROXY_OUT | grep -q -- '--to-ports 9040'
+      changed_when: false
+
+    # Plain HTTPS from the VM: it must be redirected into Tor by the rules.
+    - name: Test Tor connectivity through the transparent proxy
+      uri:
+        url: https://check.torproject.org/api/ip
+        method: GET
+        timeout: 60
+      register: tor_test
+      until: tor_test.json is defined and tor_test.json.IsTor | default(false)
+      retries: 5
+      delay: 10
 
     - name: Display deployment status
       debug:
@@ -107,8 +94,7 @@
           - "KVM Tailscale Tor Exit Node deployment completed successfully!"
           - "VM IP: {{ ansible_default_ipv4.address }}"
           - "Tailscale status: Run 'sudo tailscale status' to check"
-          - "Tor container: {{ tor_container_info.container.State.Status }}"
-          - "Tor IP check: {{ tor_test.json.IP if tor_test.json is defined else 'Failed to get Tor IP' }}"
-          - "Transparent proxy: {{ 'Active' if tor_proxy_status.stdout == 'active' else 'Inactive' }}"
+          - "Tor container: {{ tor_container_state.stdout }}"
+          - "Tor exit IP: {{ tor_test.json.IP }}"
           - "Next step: Authorize this machine in Tailscale admin panel"
-          - "Verify exit node: ssh to VM and run 'curl -s https://ipinfo.io/ip'"
+          - "Verify exit node: ssh to VM and run 'curl -s https://check.torproject.org/api/ip'"

@@ -1,0 +1,52 @@
+#!/bin/bash
+
+# Joins this VM to the tailnet and advertises it as an exit node.
+# - The auth key is read from TS_AUTH_KEY and only used when the node is not
+#   logged in yet, so a re-run with a consumed single-use key still works.
+# - --netfilter-mode=off: the transparent proxy rules own the firewall; no
+#   client traffic is forwarded, so tailscale's own FORWARD/NAT rules are not
+#   needed and cannot bypass the drops.
+# - --accept-dns=false: /etc/resolv.conf stays on the local Tor DNS path.
+
+set -euo pipefail
+
+backend_state() {
+	tailscale status --json 2>/dev/null |
+		sed -n 's/^ *"BackendState": *"\([A-Za-z]*\)".*/\1/p' | head -n 1
+}
+
+state=""
+for _ in $(seq 1 30); do
+	state=$(backend_state || true)
+	[ -n "$state" ] && break
+	sleep 2
+done
+if [ -z "$state" ]; then
+	echo "tailscaled is not answering" >&2
+	exit 1
+fi
+
+args=(
+	--reset
+	--advertise-exit-node
+	--accept-routes
+	--accept-dns=false
+	--netfilter-mode=off
+	--hostname={{ vm_hostname | default(inventory_hostname) | quote }}
+	--timeout=120s
+)
+
+case "$state" in
+NeedsLogin | NoState)
+	if [ -z "${TS_AUTH_KEY:-}" ]; then
+		echo "Not logged in to Tailscale and no auth key was given" >&2
+		exit 1
+	fi
+	tailscale up "${args[@]}" --auth-key="$TS_AUTH_KEY"
+	echo "joined the tailnet as an exit node"
+	;;
+*)
+	tailscale up "${args[@]}"
+	echo "already logged in (state $state); exit node settings applied"
+	;;
+esac
