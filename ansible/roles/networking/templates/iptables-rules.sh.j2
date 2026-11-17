@@ -1,0 +1,84 @@
+#!/bin/bash
+
+set -euo pipefail
+
+echo "Applying transparent proxy iptables rules (DNS-less mode)..."
+
+TOR_SOCKS_PORT=9050
+TOR_TRANS_PORT=9040
+TOR_CONTAINER_IP=172.20.0.10
+TAILSCALE_NETWORK=100.64.0.0/10
+
+echo "Flushing existing NAT rules..."
+iptables -t nat -F
+iptables -t nat -X 2>/dev/null || true
+
+ip6tables -t nat -F 2>/dev/null || true
+ip6tables -t nat -X 2>/dev/null || true
+
+echo "Creating TORPROXY chain..."
+iptables -t nat -N TORPROXY 2>/dev/null || true
+
+# Exclude local traffic
+iptables -t nat -A TORPROXY -d 127.0.0.0/8 -j RETURN
+iptables -t nat -A TORPROXY -d 10.0.0.0/8 -j RETURN
+iptables -t nat -A TORPROXY -d 172.16.0.0/12 -j RETURN
+iptables -t nat -A TORPROXY -d 192.168.0.0/16 -j RETURN
+iptables -t nat -A TORPROXY -d 169.254.0.0/16 -j RETURN
+iptables -t nat -A TORPROXY -d 224.0.0.0/4 -j RETURN
+iptables -t nat -A TORPROXY -d 240.0.0.0/4 -j RETURN
+
+# Exclude essential services
+iptables -t nat -A TORPROXY -p tcp --dport 22 -j RETURN
+iptables -t nat -A TORPROXY -p tcp --dport 41641 -j RETURN
+iptables -t nat -A TORPROXY -p udp --dport 41641 -j RETURN
+
+# Exclude connections FROM the Tor container (prevent loops)
+iptables -t nat -A TORPROXY -s $TOR_CONTAINER_IP -j RETURN
+
+# Redirect TCP traffic to Tor TransPort
+iptables -t nat -A TORPROXY -p tcp -j REDIRECT --to-ports $TOR_TRANS_PORT
+
+# Apply transparent proxy to Tailscale traffic
+iptables -t nat -A OUTPUT -s $TAILSCALE_NETWORK -p tcp -j TORPROXY
+iptables -t nat -A PREROUTING -i tailscale0 -p tcp -j TORPROXY
+
+echo "Allowing local and Tailscale traffic..."
+iptables -A INPUT -i lo -j ACCEPT
+iptables -A OUTPUT -o lo -j ACCEPT
+iptables -A INPUT -i tailscale0 -j ACCEPT
+iptables -A OUTPUT -o tailscale0 -j ACCEPT
+
+echo "Transparent proxy rules applied successfully (without DNS redirection)"
+
+# Allow docker bridge traffic
+iptables -A FORWARD -i tailscale0 -o docker0 -j ACCEPT
+iptables -A FORWARD -i docker0 -o tailscale0 -j ACCEPT
+
+# Allow specific outbound connections
+iptables -A OUTPUT -d $TOR_CONTAINER_IP -p tcp --dport $TOR_SOCKS_PORT -j ACCEPT
+iptables -A OUTPUT -p tcp --dport 80 -j ACCEPT
+iptables -A OUTPUT -p tcp --dport 443 -j ACCEPT
+iptables -A OUTPUT -p tcp --dport 22 -j ACCEPT
+iptables -A OUTPUT -p udp --dport 53 -j ACCEPT
+iptables -A OUTPUT -p udp --dport 123 -j ACCEPT
+iptables -A OUTPUT -p udp --dport 41641 -j ACCEPT
+
+# Drop other Tailscale traffic not going through Tor
+iptables -A OUTPUT -s $TAILSCALE_NETWORK -j DROP
+
+# Allow everything else
+iptables -A OUTPUT -j ACCEPT
+
+# IPv6 rules (restrictive)
+ip6tables -P INPUT DROP
+ip6tables -P FORWARD DROP
+ip6tables -P OUTPUT DROP
+ip6tables -A INPUT -i lo -j ACCEPT
+ip6tables -A OUTPUT -o lo -j ACCEPT
+
+echo "Transparent proxy iptables rules applied successfully"
+iptables -t nat -L -n -v
+echo "IPv6 blocked completely"
+
+echo "Transparent proxy iptables redirection active (no socat needed)"

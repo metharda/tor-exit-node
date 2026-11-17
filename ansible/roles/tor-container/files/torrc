@@ -1,0 +1,47 @@
+# Tor configuration for private exit node
+SocksPort 0.0.0.0:9050
+DNSPort 0.0.0.0:9053  # UDP listener (DNS over Tor). Do not probe with TCP tools like nc.
+TransPort 0.0.0.0:9040
+
+# Enable virtual address mapping for DNS (CRITICAL for DNS port)
+VirtualAddrNetworkIPv4 10.192.0.0/10
+AutomapHostsOnResolve 1
+
+# CRITICAL: Enable DNS resolution functionality
+# NOTE: ClientDNSRejectInternalAddresses cannot be set on the default Tor network.
+# Leave it at its safe default (1). See tor(1): "it is not allowed to be set on
+# the default network." Setting it caused verify-config to fail.
+ClientRejectInternalAddresses 0
+
+# Restrict SOCKS access to local/Tailscale networks only
+SocksPolicy accept 127.0.0.0/8
+SocksPolicy accept 172.16.0.0/12
+SocksPolicy accept 10.0.0.0/8
+SocksPolicy accept 100.64.0.0/10  # Tailscale CGNAT range
+SocksPolicy reject *
+
+DataDirectory /var/lib/tor
+RunAsDaemon 0
+Log notice stdout
+
+# CRITICAL: Do NOT set ClientOnly 1 - it disables DNS port
+# Force server mode to enable DNSPort
+ClientOnly 0
+
+# Exit policy - allow all traffic for your use
+ExitPolicy accept *:*
+
+# No control port for security
+ControlPort 0
+
+# Disable directory services (don't publish as relay)
+DirPort 0
+PublishServerDescriptor 0
+
+# Ensure we don't become a directory mirror
+BridgeRelay 0
+RelayBandwidthRate 0
+RelayBandwidthBurst 0
+
+# Force disable ORPort to prevent becoming a public relay
+ORPort 0

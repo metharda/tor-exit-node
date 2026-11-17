@@ -1,0 +1,37 @@
+#!/bin/bash
+
+set -euo pipefail
+
+echo "Configuring DNS to prevent leaks..."
+
+# Disable cloud-init network configuration if present
+if [ -f /etc/cloud/cloud.cfg.d/99-disable-network-config.cfg ]; then
+    echo "Cloud-init network configuration already disabled"
+else
+    echo "network: {config: disabled}" > /etc/cloud/cloud.cfg.d/99-disable-network-config.cfg
+fi
+
+# Stop and disable systemd-resolved
+systemctl disable systemd-resolved 2>/dev/null || true
+systemctl stop systemd-resolved 2>/dev/null || true
+
+# Handle symlinked resolv.conf (common with systemd-resolved)
+if [ -L /etc/resolv.conf ]; then
+    echo "Removing systemd-resolved symlink..."
+    unlink /etc/resolv.conf
+fi
+
+# Remove immutable attribute if supported (ignore errors)
+chattr -i /etc/resolv.conf 2>/dev/null || true
+
+# Configure DNS to use localhost (socat will forward to Tor 9053)
+cat > /etc/resolv.conf << EOF
+nameserver 127.0.0.1
+options edns0 trust-ad
+search .
+EOF
+
+# Set immutable attribute if supported (ignore errors)
+chattr +i /etc/resolv.conf 2>/dev/null || true
+
+echo "DNS configuration completed - localhost:53 will forward to Tor:9053"

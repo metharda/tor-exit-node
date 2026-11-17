@@ -5,6 +5,7 @@
 *.swp
 *.swo
 *.DS_Store
+._*
 __pycache__/
 *.pyc
 *.pyo
@@ -13,15 +14,14 @@ __pycache__/
 
 # Ansible
 ansible/inventory.ini
-ansible/inventory.ini.tpl
-ansible/roles/*/files/*
-ansible/roles/*/templates/*.j2
 
 # Terraform
 terraform/*.tfstate
 terraform/*.tfstate.backup
 terraform/.terraform/
 terraform/.terraform.lock.hcl
+terraform/vm_key
+terraform/vm_key.pub
 
 # Docker
 *.pid

@@ -1,0 +1,85 @@
+#!/bin/bash
+
+set -euo pipefail
+
+readonly LOG_FILE="/var/log/tor-monitor.log"
+readonly TOR_CONTAINER="tor-proxy"
+readonly CHECK_INTERVAL=30
+
+log_message() {
+    echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" | tee -a "$LOG_FILE"
+}
+
+check_tor_container() {
+    if ! docker ps --filter "name=$TOR_CONTAINER" --filter "status=running" | grep -q "$TOR_CONTAINER"; then
+        log_message "ERROR: Tor container is not running"
+        return 1
+    fi
+    
+    if ! docker exec "$TOR_CONTAINER" nc -z localhost 9050 >/dev/null 2>&1; then
+        log_message "ERROR: Tor SOCKS port not responding"
+        return 1
+    fi
+    
+    if ! docker exec "$TOR_CONTAINER" nc -z localhost 9053 >/dev/null 2>&1; then
+        log_message "ERROR: Tor DNS port not responding"
+        return 1
+    fi
+    
+    return 0
+}
+
+restart_tor_container() {
+    log_message "Attempting to restart Tor container..."
+    
+    cd /opt/tor-proxy
+    docker compose down || true
+    sleep 5
+    docker compose up -d
+    
+    sleep 15
+    
+    if check_tor_container; then
+        log_message "Tor container successfully restarted"
+        return 0
+    else
+        log_message "ERROR: Failed to restart Tor container"
+        return 1
+    fi
+}
+
+monitor_tor_logs() {
+    local log_output
+    log_output=$(docker logs "$TOR_CONTAINER" --tail 10 2>&1 || echo "")
+    
+    if echo "$log_output" | grep -q "Bootstrapped 100%"; then
+        return 0
+    fi
+    
+    if echo "$log_output" | grep -qi "error\|failed\|critical"; then
+        log_message "ERROR: Critical error detected in Tor logs"
+        return 1
+    fi
+    
+    return 0
+}
+
+main() {
+    log_message "Starting Tor container monitoring"
+    
+    while true; do
+        if ! check_tor_container || ! monitor_tor_logs; then
+            if ! restart_tor_container; then
+                log_message "CRITICAL: Unable to recover Tor container, waiting before retry"
+                sleep 300
+            fi
+        fi
+        
+        sleep "$CHECK_INTERVAL"
+    done
+}
+
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+    exec > >(tee -a "$LOG_FILE") 2>&1
+    main "$@" &
+fi
