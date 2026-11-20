@@ -54,6 +54,7 @@ The VM's own traffic other than DNS (tailscaled's control and DERP connections, 
 - **No DNS leaks.** All UDP/53 from clients and from the VM goes to Tor's DNSPort. DNS over TCP from the VM is blocked, since it can't be carried by the UDP-only DNSPort.
 - **Tor listeners are private.** TransPort, DNSPort and SOCKS accept connections only from loopback and `tailscale0` (`TOR_INPUT` chain plus UFW).
 - **Self-healing.** Docker restarts the container if it exits. Every two minutes, `tor-watchdog.timer` restarts it if its health check reports a stalled bootstrap and reinstalls the firewall rules if something removed them.
+- **Repairs fail closed.** Because the VM's own DNS goes through Tor, a broken Tor also means no DNS for repairs. When `make configure` finds Tor unhealthy, it first takes the node off the tailnet (`tailscale down`), then lets the VM resolve directly while it repairs Tor. The exit node only comes back after Tor is healthy and the redirects are reinstalled.
 - **Secrets stay out of the VM image.** The Tailscale auth key is passed to Ansible through the environment, used once with logging disabled, and never written to cloud-init, the inventory or disk.
 
 ## Requirements
@@ -103,6 +104,8 @@ Then:
    ```
 
 3. **Stop using it:** `tailscale set --exit-node=`
+
+Keep **Use Tailscale DNS** enabled on clients (the default; `tailscale set --accept-dns=true`). Tailscale then sends the client's DNS to the exit node, which answers it through Tor. With it disabled, the client asks its own resolver instead, outside the exit node.
 
 ### Unattended deploy
 
@@ -202,6 +205,8 @@ This installs `node_exporter` on `:9100` (reachable only over the tailnet). It a
 | Ansible fails at *Wait until the container health check passes* | Tor couldn't bootstrap; the task prints Tor's log. Common causes are no outbound internet from the VM, a wrong VM clock, or a network that blocks Tor (bridges are not configured). Fix the cause, then `make configure`. |
 | *This node has not joined the tailnet yet* | Export `TS_AUTHKEY` and run `make configure`. |
 | The device can't pick the exit node | Approve it in the admin console (see Quick start) and make sure your ACLs let the device use exit nodes (`autogroup:internet`). |
+| Tor container deleted or image broken | `make configure`. It switches to maintenance mode (exit node offline), rebuilds Tor and brings the node back. The watchdog alone can recreate the container but not a missing image without DNS. |
+| Exit node works but names don't resolve on a client | Enable *Use Tailscale DNS* on that client (`tailscale set --accept-dns=true`), then check with `tailscale dns query example.com`; the resolver should be `http://<exit-node-ip>:<port>/dns-query`. |
 | Exit node selected but nothing loads | `make verify`. If Tor shows unhealthy, `make logs`. The watchdog restarts it within a few minutes, or run `make ssh` and then `sudo docker restart tor-proxy`. |
 | Pages load but slowly | That's Tor. `sudo docker restart tor-proxy` builds fresh circuits. |
 | Need to inspect the rules | `make ssh`, then `sudo iptables -t nat -L TOR_CLIENTS -nv` and `sudo iptables -L TOR_FORWARD -nv`. |
