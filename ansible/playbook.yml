@@ -24,6 +24,23 @@
     - name: Gather facts
       ansible.builtin.setup:
 
+    # The node's own DNS goes through Tor, so with Tor down nothing can be
+    # installed or pulled to repair it. Take the exit node off the tailnet
+    # first (clients fail closed), then let the node resolve directly. The
+    # networking and tailscale roles bring both back once Tor is healthy.
+    - name: Take the exit node offline while Tor is down
+      ansible.builtin.shell: |
+        set -e
+        health=$(docker inspect --format {% raw %}'{{.State.Health.Status}}'{% endraw %} tor-proxy 2>/dev/null || true)
+        if [ "$health" = healthy ] || ! systemctl is-active --quiet transparent-proxy; then
+          exit 0
+        fi
+        if command -v tailscale >/dev/null; then tailscale down; fi
+        systemctl stop transparent-proxy
+        echo "maintenance mode (tor-proxy: ${health:-missing})"
+      register: maintenance
+      changed_when: maintenance.stdout is search('maintenance mode')
+
     - name: Upgrade installed packages
       ansible.builtin.apt:
         upgrade: dist
@@ -38,9 +55,10 @@
     - system-hardening
     - docker
     - tor-container
-    - tailscale
-    # Last: once it runs, the VM's own DNS goes through Tor.
+    # From here on the node's DNS goes through Tor (which is healthy by now).
     - networking
+    # Last, so clients can only reach the node once the redirects are in place.
+    - tailscale
     - role: monitoring
       when: monitoring_enabled | bool
 

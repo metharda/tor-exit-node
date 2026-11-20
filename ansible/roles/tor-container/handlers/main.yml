@@ -1,0 +1,6 @@
+---
+- name: Build the Tor image
+  ansible.builtin.command: docker compose build
+  args:
+    chdir: /opt/tor-proxy
+  changed_when: true

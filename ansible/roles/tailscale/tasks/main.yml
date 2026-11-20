@@ -33,8 +33,10 @@
 
 - name: Determine whether the node still has to join the tailnet
   ansible.builtin.set_fact:
+    # "Stopped" (after `tailscale down`) is still logged in and needs no key.
     tailscale_needs_login: >-
-      {{ tailscale_status.rc != 0 or (tailscale_status.stdout | from_json).BackendState != 'Running' }}
+      {{ tailscale_status.rc != 0
+         or (tailscale_status.stdout | from_json).BackendState in ['NeedsLogin', 'NoState'] }}
 
 - name: Require an auth key for the first login
   ansible.builtin.assert:

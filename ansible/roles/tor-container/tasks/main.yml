@@ -14,16 +14,12 @@
     - Dockerfile
     - torrc
     - docker-compose.yml
-  register: tor_files
+  # Building only on changes keeps re-runs from recreating the container (and
+  # cutting clients off while Tor restarts). `up` builds the image if missing.
+  notify: Build the Tor image
 
-# Building only on changes keeps re-runs from recreating the container (and
-# cutting clients off while Tor restarts). `up` builds the image if it is missing.
-- name: Build the Tor image
-  ansible.builtin.command: docker compose build
-  args:
-    chdir: /opt/tor-proxy
-  when: tor_files is changed
-  changed_when: true
+- name: Build the image before starting the container
+  ansible.builtin.meta: flush_handlers
 
 - name: Start the Tor container
   ansible.builtin.command: docker compose up --detach --remove-orphans
