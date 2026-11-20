@@ -10,7 +10,7 @@
 [![Tor](https://img.shields.io/badge/Tor-transparent_proxy-7D4698?logo=torproject&logoColor=white)](https://www.torproject.org)
 [![Tailscale](https://img.shields.io/badge/Tailscale-exit_node-242424?logo=tailscale&logoColor=white)](https://tailscale.com/kb/1103/exit-nodes)
 
-<img src="docs/demo/verify.gif" alt="make verify against a deployed exit node: Tor is bootstrapped, check.torproject.org confirms a Tor exit IP, the transparent-proxy and leak checks pass, and Tailscale reports the node as an approved exit node" width="860">
+<img src="docs/demo/client.gif" alt="A laptop in the tailnet: check.torproject.org reports IsTor false; after 'tailscale set --exit-node=tailscale-tor-exit' it reports IsTor true and every site sees a Tor exit IP; switching the exit node off returns IsTor false" width="860">
 
 </div>
 
@@ -27,7 +27,7 @@ Pick this machine as the exit node on a laptop, phone or tablet, and that device
 
 ## Quick start
 
-**Prerequisites:** a Linux x86_64 host with KVM and libvirt, Terraform, Ansible, and a [Tailscale auth key](https://login.tailscale.com/admin/settings/keys). See [Requirements](#requirements).
+**You need:** a Linux x86_64 host with KVM and libvirt, Terraform, Ansible, and a [Tailscale auth key](https://login.tailscale.com/admin/settings/keys). See [Requirements](#requirements).
 
 ```bash
 git clone https://github.com/metharda/tor-exit-node.git
@@ -36,9 +36,14 @@ make check-deps   # confirms the host is ready
 make deploy       # asks for VM settings and the auth key, then builds everything
 ```
 
-`make deploy` creates the VM with Terraform, configures it with Ansible, and finishes by running the health and leak check. Expect around 10 minutes on the first run, most of it package installs and Tor's first bootstrap. Then:
+<div align="center">
+<img src="docs/demo/deploy.gif" alt="make deploy, played back 10 times faster: dependency checks, the VM settings prompts, Terraform creating the VM, Ansible configuring it, and the final health and leak check passing" width="860">
+<br><sub>A real deployment, played back 10× faster. It took about 5½ minutes on the test host.</sub>
+</div>
 
-1. **Approve the exit node** in the [Tailscale admin console](https://login.tailscale.com/admin/machines): open the machine's **⋯** menu, choose *Edit route settings*, and tick *Use as exit node*. Skip this if your ACL `autoApprovers` already approve it.
+`make deploy` creates the VM with Terraform, configures it with Ansible, and finishes with the health and leak check. Then:
+
+1. **Approve the exit node** in the [Tailscale admin console](https://login.tailscale.com/admin/machines): open the machine's **⋯** menu, choose *Edit route settings*, and tick *Use as exit node*. To approve automatically, see [operations.md](docs/operations.md#approving-and-sharing-the-exit-node).
 2. **Use it** from any device, through the exit-node menu in the Tailscale app or the CLI:
 
    ```bash
@@ -73,17 +78,19 @@ flowchart LR
 ```
 
 1. A device selects the VM as its exit node, so its internet traffic arrives on the VM's `tailscale0` interface.
-2. The `transparent-proxy` rules redirect every TCP connection to Tor's **TransPort** and every DNS query to Tor's **DNSPort**, whatever server the query was addressed to. The VM's own DNS is redirected too, because Tailscale answers an exit-node client's DNS with the exit node's resolver.
-3. Tor runs as a pure client in a container that shares the VM's network namespace (`network_mode: host`). Transparent proxying needs that: Tor reads each connection's original destination from the kernel's NAT table, and that information only exists in the namespace where the redirect happened.
-4. Anything Tor cannot carry (UDP other than DNS, ICMP, IPv6) is rejected rather than forwarded, so it can't leak your real IP. Browsers fall back from QUIC to TCP automatically.
+2. The `transparent-proxy` rules redirect every TCP connection to Tor's **TransPort** and every DNS query to Tor's **DNSPort**, whatever server it was addressed to. The VM's own DNS goes to Tor too, because Tailscale answers an exit-node client's DNS with the exit node's resolver.
+3. Tor runs as a pure client in a container that shares the VM's network namespace. Transparent proxying needs that: Tor reads each connection's original destination from the kernel's NAT table, which only exists in the namespace where the redirect happened.
+4. Anything Tor can't carry (UDP other than DNS, ICMP, IPv6) is rejected rather than forwarded, so it can't leak your real IP. Browsers fall back from QUIC to TCP automatically.
 
 > [!NOTE]
-> The VM's own traffic other than DNS goes direct, not through Tor. That covers tailscaled's control and DERP connections, package updates and NTP time sync. tailscaled must reach Tailscale directly, and Tor stops working if the clock drifts. None of this traffic carries client data.
+> The VM's own traffic other than DNS goes direct: tailscaled's control and relay connections, package updates and time sync. tailscaled must reach Tailscale directly, and Tor stops working if the clock drifts. None of this traffic carries client data.
+
+The firewall chains, Tor listeners, provisioning details and design decisions are in [architecture.md](docs/architecture.md).
 
 <details>
 <summary><b>Original system design sketch</b></summary>
 
-![Hand-drawn system design: the user connects through Tailscale into a VM on the host, where traffic passes through the Tor container to the internet](tor-proxy-systemdesign.png)
+![Hand-drawn system design: the user connects through Tailscale into a VM on the host, where traffic passes through the Tor container to the internet](docs/tor-proxy-systemdesign.png)
 
 </details>
 
@@ -93,27 +100,46 @@ flowchart LR
 <img src="docs/demo/fail-closed.gif" alt="On the exit node: a DNS query to an address with no DNS server is answered by Tor; after the Tor container is stopped, the same query fails with no servers reached instead of falling back to plain DNS" width="860">
 </div>
 
-- **Fails closed.** If the Tor container is down, redirected connections are refused and DNS gets no answer, as shown above. `systemctl stop transparent-proxy` removes the redirects but keeps the forward guard, so client traffic is dropped, not forwarded.
-- **No routing around Tor.** tailscaled adds no NAT or forward rules (`--netfilter-mode=off`). The `TOR_FORWARD` chain rejects anything a client sends that wasn't redirected, and UFW's routed policy is `deny`.
-- **No DNS leaks.** All UDP/53 from clients and from the VM goes to Tor's DNSPort. DNS over TCP from the VM is blocked, since the UDP-only DNSPort can't carry it. tailscaled doesn't manage the VM's resolver (`--accept-dns=false`), so tailnet DNS settings such as a DoH provider can't bypass Tor on the exit node.
-- **Tor listeners are private.** TransPort, DNSPort and SOCKS accept connections only from loopback and `tailscale0` (`TOR_INPUT` chain plus UFW).
-- **Self-healing.** Docker restarts the container if it exits. Every two minutes, `tor-watchdog.timer` restarts it if its health check reports a stalled bootstrap, and reinstalls the firewall rules if something removed them.
-- **Repairs fail closed.** A broken Tor also means no DNS for repairs. When `make configure` finds Tor unhealthy, it first takes the node off the tailnet (`tailscale down`), then lets the VM resolve directly while it rebuilds Tor. The exit node only comes back once Tor is healthy and the redirects are in place.
-- **Secrets stay out of the VM image.** The Tailscale auth key is passed to Ansible through the environment, used once with logging disabled, and never written to cloud-init, the inventory or disk.
+- **Fails closed.** With Tor down, redirected connections are refused and DNS gets no answer, as shown above. Stopping the firewall service removes the redirects but keeps the guards, so client traffic is dropped, not forwarded.
+- **No routing around Tor.** tailscaled adds no NAT or forward rules of its own (`--netfilter-mode=off`). Anything a client sends that wasn't redirected is rejected.
+- **No DNS leaks.** All DNS from clients and from the VM goes to Tor. DNS over TCP from the VM is blocked. Tailnet DNS settings such as a DNS-over-HTTPS provider can't bypass Tor on the exit node (`--accept-dns=false`).
+- **Private Tor listeners.** Tor's ports accept connections only from loopback and the tailnet.
+- **Repairs fail closed.** When Tor is broken, `make configure` takes the node off the tailnet before repairing it.
+- **Secrets stay out of the VM image.** The auth key is used once, with logging disabled, and never written to cloud-init, the inventory or disk.
 
 > [!WARNING]
 > **This is not Tor Browser.** It hides your IP address, not your identity. Cookies, logins and your browser's fingerprint still identify you to the sites you visit. Use [Tor Browser](https://www.torproject.org/download/) when you need strong anonymity.
+
+The full threat model, what is and isn't protected, and how secrets are stored are in [security.md](docs/security.md).
+
+## Day-to-day
+
+<div align="center">
+<img src="docs/demo/verify.gif" alt="make verify against the deployed exit node: Tor is bootstrapped, check.torproject.org confirms a Tor exit IP, every transparent-proxy and leak check passes, and Tailscale reports the node as an approved exit node" width="860">
+</div>
+
+| Command | What it does |
+| --- | --- |
+| `make verify` | Health and leak check on the VM, as above |
+| `make status` | Terraform outputs, container and firewall state, `tailscale status` |
+| `make logs` | Recent Tor log, plus watchdog and firewall journal entries |
+| `make ssh` | Shell on the VM |
+| `make configure` | Re-apply the configuration. Idempotent; no auth key needed once joined. |
+| `make destroy` | Delete the VM, its disk, pool and network |
+| `make lint` | shellcheck, `terraform validate`/`fmt`, ansible-lint |
+
+What each check means, self-healing, updates, monitoring and troubleshooting: [operations.md](docs/operations.md).
 
 ## Requirements
 
 | | |
 | --- | --- |
 | **KVM host** | Linux on x86_64 with hardware virtualization (`/dev/kvm`) and libvirt (`qemu:///system`). The VM uses 2 GB RAM, 2 vCPUs and 20 GB of disk by default. Tested on Debian 13. |
-| **Tools** | Terraform ≥ 1.3, Ansible (ansible-core ≥ 2.15 with `community.general` and `ansible.posix`; the `ansible` pip package includes both), OpenSSH client, `xsltproc`. For `make lint`: `shellcheck` and `ansible-lint`. |
+| **Tools** | Terraform ≥ 1.3, Ansible (ansible-core ≥ 2.15 with `community.general` and `ansible.posix`; the `ansible` pip package includes both), OpenSSH client, `xsltproc` and `mkisofs` (from `genisoimage`). For `make lint`: `shellcheck` and `ansible-lint`. |
 | **Tailscale** | An account and an [auth key](https://login.tailscale.com/admin/settings/keys). A reusable key is handy for retries. A tag such as `tag:exit-node` is optional. |
 
 ```bash
-sudo apt install qemu-kvm libvirt-daemon-system libvirt-clients xsltproc
+sudo apt install qemu-kvm libvirt-daemon-system libvirt-clients xsltproc genisoimage
 sudo usermod -aG libvirt "$USER"   # log out and back in, or run as root
 ```
 
@@ -140,116 +166,23 @@ Every `make deploy` prompt can be preset through the environment for unattended 
 VM_PASSWORD='…' TS_AUTHKEY='tskey-auth-…' VM_NAME=tor-exit make deploy
 ```
 
-<details>
-<summary><b>Advanced Terraform settings</b></summary>
-
-Override with `TF_VAR_<name>`:
-
-| Variable | Default | Meaning |
-| --- | --- | --- |
-| `network_cidr` | `192.168.100.0/24` | Private NAT network of the VM. Change it if the subnet is already used on the host. |
-| `pool_path` | `/var/lib/libvirt/images` | Directory in which the VM's storage pool is created |
-| `libvirt_uri` | `qemu:///system` | libvirt connection |
-
-</details>
-
-## Commands
-
-| Command | What it does |
-| --- | --- |
-| `make deploy` | Create and configure the VM |
-| `make verify` | Full health and leak check on the VM (see the GIF at the top) |
-| `make status` | Terraform outputs, container and firewall state, `tailscale status` |
-| `make logs` | Recent Tor log, plus watchdog and transparent-proxy journal entries |
-| `make ssh` | Shell on the VM |
-| `make configure` | Re-apply the configuration, e.g. after changing a role. Idempotent; no auth key needed once joined. |
-| `make destroy` | Delete the VM, its disk, pool and network. Asks you to type the VM name; `CONFIRM=<name>` skips the prompt. |
-| `make lint` | shellcheck, `terraform validate`/`fmt`, ansible-lint |
-
-<details>
-<summary><b>Checking from a client</b></summary>
-
-With the exit node selected on a device:
-
-```bash
-curl https://check.torproject.org/api/ip           # "IsTor": true
-curl https://icanhazip.com                         # a Tor exit IP, never yours
-tailscale dns query example.com                    # resolver: http://<exit-node-ip>:<port>/dns-query
-ping -c1 1.1.1.1                                   # fails: Tor does not carry ICMP
-curl -6 https://icanhazip.com                      # fails: IPv6 is blocked
-```
-
-</details>
-
-<details>
-<summary><b>Monitoring (optional)</b></summary>
-
-Monitoring is off by default. To enable it:
-
-```bash
-cd ansible && ansible-playbook playbook.yml -e monitoring_enabled=true
-```
-
-This installs `node_exporter` on `:9100`, reachable only over the tailnet. It also publishes `tor_bootstrapped`, `tailscale_running` and `transparent_proxy_rules_present` through the textfile collector, refreshed every minute.
-
-</details>
+Terraform settings (network subnet, storage path, libvirt URI) are listed in [operations.md](docs/operations.md#deployment-settings).
 
 ## Limitations
 
 - **TCP and DNS only.** UDP applications (games, VoIP, some video calls) don't work while the exit node is selected.
 - **Tor speed.** Some sites block Tor exits or show them CAPTCHAs.
 - **IPv4 only.** IPv6 is disabled on the VM.
-- **Secrets on the deploying machine.** Terraform state (`terraform/terraform.tfstate`) holds the VM password and the SSH private key. Keep the checkout private; both files are git-ignored.
+- **Secrets on the deploying machine.** Terraform state holds the VM password and the SSH private key. Keep the checkout private; both files are git-ignored.
 
-## Troubleshooting
+## Documentation
 
-<details>
-<summary><b>Show common problems and fixes</b></summary>
-
-| Symptom | Check / fix |
+| Document | Contents |
 | --- | --- |
-| *Cannot reach qemu:///system* or permission denied | Run as root, or add your user to the `libvirt` group and log in again. |
-| Terraform: *network … overlaps*, or the VM gets no IP | `192.168.100.0/24` is in use on the host. Redeploy with `TF_VAR_network_cidr=192.168.150.0/24`. |
-| Ansible fails at *Wait until the container health check passes* | Tor couldn't bootstrap; the task prints Tor's log. Common causes: no outbound internet from the VM, a wrong clock, or a network that blocks Tor (bridges are not configured). Fix it, then `make configure`. |
-| *This node has not joined the tailnet yet* | Export `TS_AUTHKEY` and run `make configure`. |
-| A device can't pick the exit node | Approve it in the admin console (see [Quick start](#quick-start)) and make sure your ACLs let the device use exit nodes (`autogroup:internet`). |
-| Exit node works, but names don't resolve on a device | Enable *Use Tailscale DNS* on that device, then check `tailscale dns query example.com`. The resolver should be `http://<exit-node-ip>:<port>/dns-query`. |
-| Exit node selected, but nothing loads | `make verify`. If Tor is unhealthy, `make logs`. The watchdog restarts it within minutes, or run `make ssh` and then `sudo docker restart tor-proxy`. |
-| Tor container deleted or its image broken | `make configure` switches to maintenance mode (exit node offline), rebuilds Tor and brings the node back. |
-| Pages load, but slowly | That's Tor. `sudo docker restart tor-proxy` builds fresh circuits. |
-| Want to inspect the rules | `make ssh`, then `sudo iptables -t nat -L TOR_CLIENTS -nv` and `sudo iptables -L TOR_FORWARD -nv`. |
-| Locked out of SSH | `sudo virsh console <vm-name>` on the KVM host, and log in with the VM password. |
-
-</details>
-
-## Development
-
-<details>
-<summary><b>Repository layout</b></summary>
-
-```text
-.
-├── Makefile                  entry point (make help)
-├── terraform/                libvirt VM: storage pool, NAT network, cloud-init, disk
-├── ansible/
-│   ├── playbook.yml
-│   └── roles/
-│       ├── system-hardening/ SSH, UFW, fail2ban, sysctl
-│       ├── docker/           Docker Engine and Compose v2
-│       ├── tor-container/    Tor image, compose file, watchdog
-│       ├── networking/       transparent-proxy firewall, tor-exit-check
-│       ├── tailscale/        exit-node login
-│       └── monitoring/       optional node_exporter
-├── scripts/                  deploy, destroy, check-dependencies
-└── docs/demo/                VHS tapes and the GIFs they render
-```
-
-</details>
-
-- Change a role, then run `make configure` against a deployed VM. Every role is idempotent.
-- `make lint` must pass: shellcheck, `terraform validate`, `terraform fmt -check` and ansible-lint (production profile).
-- `tor-exit-check` on the VM is the end-to-end acceptance test. Ansible runs it at the end of every play, and `make verify` runs it on demand.
-- The GIFs are rendered from real sessions by [VHS](https://github.com/charmbracelet/vhs). To regenerate them, run `vhs docs/demo/verify.tape` and `vhs docs/demo/fail-closed.tape` from the repo root on the KVM host, with a deployed VM. The second tape briefly stops Tor on the VM.
+| [Architecture](docs/architecture.md) | Components, traffic path, Tor listeners, firewall chains, provisioning details, design decisions |
+| [Security](docs/security.md) | Threat model, leak guards, hardening, secrets |
+| [Operations](docs/operations.md) | Commands, what `make verify` checks, approval, self-healing, updates, monitoring, settings, troubleshooting |
+| [Development](docs/development.md) | Repository layout, workflow, testing failure cases, re-recording the demos |
 
 ## License
 
