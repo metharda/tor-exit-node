@@ -1,0 +1,4 @@
+---
+monitoring_node_exporter_version: "1.8.2"
+monitoring_node_exporter_release: >-
+  https://github.com/prometheus/node_exporter/releases/download/v{{ monitoring_node_exporter_version }}
