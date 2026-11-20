@@ -5,27 +5,31 @@ variable "libvirt_uri" {
 }
 
 variable "vm_name" {
-  description = "Name of the virtual machine"
+  description = "Name of the VM; also prefixes its libvirt pool and network"
   type        = string
   default     = "tailscale-tor-exit"
+
+  validation {
+    condition     = can(regex("^[a-z0-9][a-z0-9-]{0,40}$", var.vm_name))
+    error_message = "Use lowercase letters, digits and dashes (max 41 characters)."
+  }
 }
 
 variable "vm_username" {
-  description = "Username for the VM"
+  description = "Login user created in the VM"
   type        = string
   default     = "ubuntu"
 }
 
 variable "vm_password" {
-  description = "Password for the VM user"
+  description = "Password for the VM user (console login only; SSH is key-only)"
   type        = string
   sensitive   = true
-}
 
-variable "tailscale_auth_key" {
-  description = "Tailscale authentication key"
-  type        = string
-  sensitive   = true
+  validation {
+    condition     = length(var.vm_password) >= 8
+    error_message = "The VM password must be at least 8 characters."
+  }
 }
 
 variable "memory_mb" {
@@ -46,29 +50,14 @@ variable "disk_size_gb" {
   default     = 20
 }
 
-variable "storage_pool" {
-  description = "Libvirt storage pool name"
+variable "pool_path" {
+  description = "Host directory in which the VM's storage pool directory is created"
   type        = string
-  default     = "default"
+  default     = "/var/lib/libvirt/images"
 }
 
-variable "network_name" {
-  description = "Libvirt network name"
+variable "network_cidr" {
+  description = "Subnet of the VM's private NAT network; must not overlap host networks"
   type        = string
-  default     = "default"
-}
-
-variable "instance_name" {
-  description = "Name for the exit node configuration"
-  type        = string
-  default     = "tailscale-tor-exit"
-}
-
-locals {
-  tags = {
-    Name        = var.instance_name
-    Environment = "production"
-    Purpose     = "tailscale-tor-exit-node"
-    Managed     = "terraform"
-  }
+  default     = "192.168.100.0/24"
 }
