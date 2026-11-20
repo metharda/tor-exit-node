@@ -1,0 +1,36 @@
+# Tor client for a transparent Tailscale exit node.
+# The container shares the VM's network namespace, so these listeners are
+# bound on the VM itself. Only lo and tailscale0 may reach them: the
+# transparent-proxy firewall drops everything else.
+
+# Pure client: never relay, never exit for others.
+ClientOnly 1
+ORPort 0
+DirPort 0
+
+# Transparent TCP proxy (iptables REDIRECT target for client TCP).
+TransPort 0.0.0.0:9040
+# DNS over Tor, UDP only. Clients are redirected to 9053; the VM's own queries
+# to 9054. The loopback listener must be bound to 127.0.0.1 explicitly: a UDP
+# reply from a 0.0.0.0 socket leaves from the interface address, which the
+# kernel cannot match back to the redirected query.
+DNSPort 0.0.0.0:9053
+DNSPort 127.0.0.1:9054
+# SOCKS for explicit use from the VM or tailnet.
+SocksPort 0.0.0.0:9050
+SocksPolicy accept 127.0.0.0/8
+SocksPolicy accept 100.64.0.0/10
+SocksPolicy reject *
+
+# .onion names resolve to virtual addresses that TransPort understands.
+VirtualAddrNetworkIPv4 10.192.0.0/10
+AutomapHostsOnResolve 1
+
+# Local control socket, used only by the container health check to read the
+# bootstrap state. The data directory is 0700 and owned by tor.
+ControlSocket /var/lib/tor/control.sock
+
+DataDirectory /var/lib/tor
+AvoidDiskWrites 1
+RunAsDaemon 0
+Log notice stdout

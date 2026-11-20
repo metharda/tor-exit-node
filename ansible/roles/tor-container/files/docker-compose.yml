@@ -1,0 +1,21 @@
+services:
+  tor-proxy:
+    build: .
+    image: tor-proxy:local
+    container_name: tor-proxy
+    restart: unless-stopped
+    # TransPort needs the original destination of REDIRECTed connections,
+    # which is only visible inside the namespace where the NAT happened.
+    network_mode: host
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp
+    volumes:
+      - tor-data:/var/lib/tor
+
+volumes:
+  tor-data:
