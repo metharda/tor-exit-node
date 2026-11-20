@@ -18,7 +18,13 @@ DNSPort 0.0.0.0:9053
 DNSPort 127.0.0.1:9054
 # SOCKS for explicit use from the VM or tailnet.
 SocksPort 0.0.0.0:9050
+# SocksPolicy also governs DNSPort. Redirected DNS from the VM itself keeps the
+# VM's private source address, so private ranges must be accepted; the
+# firewall already limits these ports to loopback and the tailnet.
 SocksPolicy accept 127.0.0.0/8
+SocksPolicy accept 10.0.0.0/8
+SocksPolicy accept 172.16.0.0/12
+SocksPolicy accept 192.168.0.0/16
 SocksPolicy accept 100.64.0.0/10
 SocksPolicy reject *
 

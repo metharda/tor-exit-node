@@ -26,6 +26,8 @@ expect() {
 	shift
 	if "$@" >/dev/null 2>&1; then pass "$label"; else fail "$label"; fi
 }
+# True when the query returns at least one IPv4 address (not just any reply).
+resolves() { dig +short +time=10 +tries=2 "$@" A | grep -Eq '^[0-9]+(\.[0-9]+){3}$'; }
 refute() {
 	local label="$1"
 	shift
@@ -39,7 +41,8 @@ if [[ "$health" == healthy ]]; then
 else
 	fail "tor-proxy container health is '$health' (docker logs tor-proxy)"
 fi
-tor_ip=$(curl -fsS --max-time 60 --socks5-hostname 127.0.0.1:9050 https://check.torproject.org/api/ip 2>/dev/null)
+# Retried: a single Tor circuit can be slow or fail without anything being wrong.
+tor_ip=$(curl -fsS --retry 2 --retry-all-errors --max-time 45 --socks5-hostname 127.0.0.1:9050 https://check.torproject.org/api/ip 2>/dev/null)
 if [[ "$(jq -r .IsTor <<<"$tor_ip" 2>/dev/null)" == true ]]; then
 	pass "check.torproject.org confirms Tor (exit IP $(jq -r .IP <<<"$tor_ip"))"
 else
@@ -50,7 +53,7 @@ section "Transparent proxy"
 expect "iptables redirects and leak guards are installed" /usr/local/sbin/transparent-proxy status
 # 192.0.2.53 is a reserved documentation address with no DNS server behind it:
 # an answer can only come from the redirect to Tor's DNSPort.
-expect "DNS sent to any server is answered by Tor" dig +short +time=10 +tries=2 @192.0.2.53 check.torproject.org
+expect "DNS sent to any server is answered by Tor" resolves @192.0.2.53 check.torproject.org
 expect "the system resolver works through Tor" getent ahostsv4 check.torproject.org
 refute "DNS over TCP cannot bypass Tor" dig +tcp +time=3 +tries=1 @1.1.1.1 check.torproject.org
 expect "IPv6 is disabled" test "$(sysctl -n net.ipv6.conf.all.disable_ipv6)" = 1
