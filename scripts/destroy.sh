@@ -16,7 +16,7 @@ step "Destroying the exit node deployment"
 info "This deletes the VM, its disk, its storage pool and its network."
 info "Remember to remove the machine from https://login.tailscale.com/admin/machines"
 if [[ "${CONFIRM:-}" != "$vm_name" ]]; then
-	read -rp "    Type '$vm_name' to confirm: " CONFIRM
+	read -rp "    Type '$vm_name' to confirm: " CONFIRM || true
 	[[ "$CONFIRM" == "$vm_name" ]] || die "confirmation did not match, nothing was destroyed"
 fi
 

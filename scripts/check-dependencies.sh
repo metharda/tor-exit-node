@@ -22,6 +22,7 @@ need ansible-playbook "pipx install --include-deps ansible (or: apt install ansi
 need virsh "apt install libvirt-daemon-system libvirt-clients qemu-kvm"
 need ssh "apt install openssh-client"
 need xsltproc "apt install xsltproc (used by the libvirt provider to set the disk type)"
+need mkisofs "apt install genisoimage (used by the libvirt provider to build the cloud-init ISO)"
 
 if [[ -e /dev/kvm ]]; then
 	ok "KVM (/dev/kvm)"
